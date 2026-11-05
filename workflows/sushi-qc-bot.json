@@ -1,0 +1,735 @@
+{
+  "name": "Sushi QC Bot — dish weight control against recipe cards",
+  "nodes": [
+    {
+      "id": "tg_trigger",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1200,
+        300
+      ],
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {
+          "download": true
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram bot"
+        }
+      }
+    },
+    {
+      "id": "router",
+      "name": "Роутер",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        -980,
+        300
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r-stats",
+                    "leftValue": "={{ $json.message.text }}",
+                    "rightValue": "/stats",
+                    "operator": {
+                      "type": "string",
+                      "operation": "startsWith"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "stats"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r-photo",
+                    "leftValue": "={{ $json.message.photo }}",
+                    "rightValue": "",
+                    "operator": {
+                      "type": "array",
+                      "operation": "exists",
+                      "singleValue": true
+                    }
+                  },
+                  {
+                    "id": "r-doc",
+                    "leftValue": "={{ $json.message.document?.mime_type ?? '' }}",
+                    "rightValue": "image/",
+                    "operator": {
+                      "type": "string",
+                      "operation": "startsWith"
+                    }
+                  }
+                ],
+                "combinator": "or"
+              },
+              "renameOutput": true,
+              "outputKey": "photo"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "help"
+        }
+      }
+    },
+    {
+      "id": "sheet_cards",
+      "name": "Техкарти — читання",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "position": [
+        -740,
+        300
+      ],
+      "parameters": {
+        "authentication": "serviceAccount",
+        "resource": "sheet",
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_YOUR_SPREADSHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Техкарти"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_GOOGLE_SERVICE_ACCOUNT_CREDENTIAL_ID",
+          "name": "Google Sheets (service account)"
+        }
+      }
+    },
+    {
+      "id": "match_caption",
+      "name": "Підпис → кандидат",
+      "notes": "Why Code: Switch/IF/Filter cannot do fuzzy matching of a free-text caption against dish names, aliases and R-codes, nor build the dynamic Vision prompt and pass the Telegram photo binary along.",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "onError": "continueErrorOutput",
+      "position": [
+        -500,
+        280
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const readErr = $input.all().find(i => i.json && i.json.error);\nif (readErr) throw new Error('Техкарти: ' + readErr.json.error);\nconst trig = $('Telegram Trigger').first();\nconst msg = trig.json.message || {};\nconst caption = String(msg.caption || '').trim();\nconst isActive = v => v === true || ['TRUE', '1', 'ТАК', 'YES'].includes(String(v ?? '').trim().toUpperCase());\nconst num = v => Number(String(v ?? '').replace(',', '.'));\nconst cards = $input.all().map(i => i.json)\n  .filter(c => c && c.dish_id && c.dish_name && isActive(c.active))\n  .map(c => ({ dish_id: String(c.dish_id).trim().toUpperCase(), dish_name: String(c.dish_name).trim(), aliases: String(c.aliases || ''), category: String(c.category || ''), norm_grams: num(c.norm_grams), tolerance_pct: num(c.tolerance_pct), visual_features: String(c.visual_features || '') }))\n  .filter(c => Number.isFinite(c.norm_grams) && c.norm_grams > 0);\nif (!cards.length) throw new Error('Техкарти: немає жодної активної позиції');\nconst norm = s => String(s || '').toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-яіїєґ0-9]+/g, ' ').replace(/\\s+/g, ' ').trim();\nconst toks = s => norm(s).split(' ').filter(w => w.length >= 3 && !/\\d/.test(w));\nconst names = c => [c.dish_name].concat(c.aliases.split(';')).map(norm).filter(Boolean);\n\nlet card = null, captionCandidates = [], normFromCaption = null, idGiven = false;\nif (caption) {\n  const capN = norm(caption);\n  const idm = caption.match(/(?:^|[^a-zа-яіїєґ])[rр]\\s?-?(\\d{1,3})(?!\\d)/i);\n  if (idm) { idGiven = true; const id = 'R' + String(Number(idm[1])).padStart(2, '0'); card = cards.find(c => c.dish_id === id) || null; }\n  if (!card) card = cards.find(c => names(c).includes(capN)) || null;\n  if (!card) {\n    const capW = toks(caption);\n    if (capW.length) {\n      const need = Math.max(1, Math.ceil(capW.length * 0.5));\n      let bestS = 0, best = [];\n      for (const c of cards) {\n        const nt = names(c).flatMap(n => n.split(' ')).filter(w => w.length >= 3);\n        let s = 0; for (const w of capW) if (nt.some(x => x === w || x.startsWith(w) || w.startsWith(x))) s++;\n        if (s > bestS) { bestS = s; best = [c]; } else if (s === bestS && s > 0) best.push(c);\n      }\n      if (bestS >= need) { if (best.length === 1) card = best[0]; else captionCandidates = best.map(c => c.dish_id); }\n    }\n  }\n  if (!card && !captionCandidates.length && !idGiven) {\n    const gm = caption.match(/(\\d{2,4})(?:[.,]\\d+)?\\s*(?:г|гр|g)?(?![\\d])/i);\n    if (gm) { const n = Number(gm[1]); if (n >= 20 && n <= 5000) normFromCaption = n; }\n  }\n}\n\nconst base = 'Подивись на фото страви на кухонних вагах. Зчитай показання дисплея — вагу в грамах. ВАЖЛИВО: дисплей може показувати число з десятковою крапкою або комою (напр. 384.8 або 384,8) — не пропускай її і поверни число саме як на дисплеї. Коротко опиши страву українською: тип (рол / макі / нігірі / гункан / сет / поке), що зверху, колір, чи є кунжут або соус, сира риба чи запечена / у клярі.';\nconst check = card ? ' Кухар підписав фото як «' + card.dish_name + '». Очікувані видимі ознаки за техкартою: ' + card.visual_features + '. Порівняй фото з цими ознаками: visual_match=false лише за явної невідповідності (інша риба чи топпінг, запечене замість сирого, інший тип страви); якщо ознаки не видно або є сумнів — visual_match=null.' : ' Підпису зі стравою немає, тому visual_match=null.';\nconst fmt = ' Поверни СТРОГО валідний JSON одним рядком без markdown: {\"scale_grams\": <число або null>, \"readable\": <true|false>, \"looks_like\": \"<короткий опис>\", \"visual_match\": <true|false|null>, \"visual_reason\": \"<коротко чому, або порожньо>\"}. Якщо цифри на дисплеї не видно — readable=false, scale_grams=null.';\n\nreturn [{ json: { caption, card, match_source: card ? 'caption' : (normFromCaption ? 'norm' : ''), caption_candidates: captionCandidates, norm_from_caption: normFromCaption, cards, cards_count: cards.length, vision_prompt: base + check + fmt }, binary: trig.binary }];"
+      }
+    },
+    {
+      "id": "vision",
+      "name": "Vision — вага і ознаки",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1500,
+      "onError": "continueErrorOutput",
+      "position": [
+        -260,
+        280
+      ],
+      "parameters": {
+        "resource": "image",
+        "operation": "analyze",
+        "modelId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "gpt-4o",
+          "cachedResultName": "gpt-4o"
+        },
+        "text": "={{ $json.vision_prompt }}",
+        "inputType": "base64",
+        "binaryPropertyName": "data",
+        "options": {}
+      },
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI"
+        }
+      }
+    },
+    {
+      "id": "verdict",
+      "name": "Вердикт",
+      "notes": "Why Code: one node combines weight vs norm ± tolerance, caption match, visual check, the ×10 decimal-point fix and the weight-based candidate search — the native alternative would be a long chain of IF / Set / Filter / Sort nodes.",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "onError": "continueErrorOutput",
+      "position": [
+        -20,
+        280
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const N = '\\n';\nconst DEFAULT_TOL = 2.9;\nconst pre = $('Підпис → кандидат').first().json;\nconst msg = $('Telegram Trigger').first().json.message || {};\nconst cards = pre.cards || [];\nconst v = $input.first().json || {};\nconst vt = typeof v === 'string' ? v : (v.content ?? v.text ?? v.output ?? (v.message && v.message.content) ?? JSON.stringify(v));\nlet vp = {}; try { const m = String(vt).match(/\\{[\\s\\S]*\\}/); if (m) vp = JSON.parse(m[0]); } catch (e) {}\nlet scale = Number(String(vp.scale_grams ?? '').replace(',', '.'));\nif (vp.scale_grams === null || vp.scale_grams === undefined || vp.scale_grams === '' || !Number.isFinite(scale) || scale <= 0) scale = null;\nconst readable = scale !== null && vp.readable !== false;\nconst looks = String(vp.looks_like || '').slice(0, 200);\nconst vmatch = vp.visual_match === true ? true : (vp.visual_match === false ? false : null);\nconst vreason = String(vp.visual_reason || '').slice(0, 200);\nconst visionEmpty = !('scale_grams' in vp) && !('readable' in vp);\nconst KINDS = [\n  { re: /поке|боул|миск/, cats: ['поке'] },\n  { re: /нігірі/, cats: ['нігірі'] },\n  { re: /гункан|човник/, cats: ['гункани'] },\n  { re: /рол|макі|сет/, cats: ['роли', 'запечені роли', 'темпура роли', 'макі', 'футомакі', 'сети'] }\n];\nconst kindHit = KINDS.find(k => k.re.test(looks.toLowerCase()));\nconst kind = kindHit ? kindHit.cats : null;\nconst kindOk = c => !kind || kind.includes(c.category);\nconst tolOf = c => (Number.isFinite(c.tolerance_pct) && c.tolerance_pct > 0) ? c.tolerance_pct : DEFAULT_TOL;\nconst fixScale = (s, n) => (s != null && n && s >= n * 3 && s / 10 >= n * 0.5 && s / 10 <= n * 1.5) ? Math.round(s) / 10 : s;\nconst devOf = (s, n) => Math.round(((s - n) / n) * 1000) / 10;\n\nlet card = pre.card || null, source = pre.match_source || '', candidates = [];\nlet verdict, normG = null, tol = null, deviation = null, actual = scale;\nif (!card && pre.caption_candidates && pre.caption_candidates.length) {\n  const tied = cards.filter(c => pre.caption_candidates.includes(c.dish_id));\n  if (scale != null) {\n    const sc = tied.map(c => ({ c, d: Math.abs(devOf(fixScale(scale, c.norm_grams), c.norm_grams)) })).sort((a, b) => a.d - b.d);\n    const ok = sc.filter(x => x.d <= tolOf(x.c));\n    if (ok.length === 1) { card = ok[0].c; source = 'caption'; }\n  }\n  if (!card) candidates = tied.slice(0, 3);\n}\nif (!readable) verdict = 'UNREADABLE';\nelse if (card) {\n  normG = card.norm_grams; tol = tolOf(card); actual = fixScale(scale, normG); deviation = devOf(actual, normG);\n  verdict = (vmatch === false && pre.card) ? 'MISMATCH' : (Math.abs(deviation) <= tol ? 'OK' : 'BRAK');\n} else if (pre.norm_from_caption) {\n  normG = pre.norm_from_caption; tol = DEFAULT_TOL; actual = fixScale(scale, normG); deviation = devOf(actual, normG);\n  verdict = Math.abs(deviation) <= tol ? 'OK' : 'BRAK'; source = 'norm';\n} else if (candidates.length) {\n  verdict = 'LOWCONF';\n} else {\n  const sc = cards.map(c => { const a = fixScale(scale, c.norm_grams); return { c, a, d: Math.abs(devOf(a, c.norm_grams)) }; }).sort((x, y) => x.d - y.d);\n  const within = sc.filter(x => x.d <= tolOf(x.c) && kindOk(x.c));\n  if (within.length === 1) { const x = within[0]; card = x.c; normG = card.norm_grams; tol = tolOf(card); actual = x.a; deviation = devOf(actual, normG); verdict = 'OK'; source = 'weight'; }\n  else { verdict = 'LOWCONF'; const pool = within.length ? within : sc.filter(x => x.d <= 25); candidates = pool.slice().sort((a, b) => (kindOk(b.c) - kindOk(a.c)) || (a.d - b.d)).slice(0, 3).map(x => x.c); }\n}\n\nconst now = new Date();\nconst ts = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Kyiv', dateStyle: 'short', timeStyle: 'medium' }).format(now);\nconst from = msg.from || {};\nconst chef = [from.first_name, from.last_name].filter(Boolean).join(' ') + (from.username ? ' (@' + from.username + ')' : '');\nconst sign = deviation != null && deviation > 0 ? '+' : '';\nconst title = card ? card.dish_id + ' · ' + card.dish_name : (pre.norm_from_caption ? 'Норма з підпису: ' + pre.norm_from_caption + ' г' : '');\nconst via = { caption: 'за підписом', norm: 'норма з підпису', weight: 'визначено за вагою — якщо страва інша, вкажіть назву або код у підписі' }[source] || '';\nconst weightLines = () => ['Норма: ' + normG + ' г ±' + tol + '%', 'На вагах: ' + actual + ' г', 'Відхилення: ' + sign + deviation + '%'];\nconst candLines = () => candidates.length ? ['Можливо:'].concat(candidates.map(c => '• ' + c.dish_id + ' ' + c.dish_name + ' — ' + c.norm_grams + ' г')) : [];\nlet lines;\nif (verdict === 'OK') lines = ['✅ У нормі', title].concat(weightLines(), ['(' + via + ')']);\nelse if (verdict === 'BRAK') lines = ['⛔️ БРАК — поза допуском', title].concat(weightLines(), ['(' + via + ')', 'Записано в журнал.']);\nelse if (verdict === 'MISMATCH') lines = ['🚫 Фото не схоже на «' + card.dish_name + '»', 'Причина: ' + (vreason || looks || 'ознаки не збігаються з техкартою')].concat(weightLines(), ['Перевірте страву або підпис. Записано в журнал.']);\nelse if (verdict === 'LOWCONF') lines = ['⚠️ Не вдалося визначити позицію', (pre.caption && !pre.card && !pre.norm_from_caption && !(pre.caption_candidates || []).length) ? 'У техкарті не знайдено «' + pre.caption + '».' : '', 'На вагах: ' + (actual != null ? actual + ' г' : '—')].concat(candLines(), ['Вкажіть у підписі назву або код страви (напр. «R01»). Записано в журнал.']);\nelse lines = visionEmpty ? ['❓ Сервіс розпізнавання не відповів.', 'Надішліть фото ще раз. Записано в журнал.'] : ['❓ Не вдалося зчитати цифри на вагах.', 'Сфотографуйте так, щоб дисплей ваг було чітко видно. Записано в журнал.'];\nconst reply = lines.filter(Boolean).join(N);\nconst visual_check = (pre.card && source === 'caption') ? (vmatch === true ? 'match' : (vmatch === false ? 'mismatch' : 'unsure')) : 'n/a';\n\nreturn [{ json: { ts, date: ts.slice(0, 10), chef, chat_id: String((msg.chat && msg.chat.id) ?? from.id ?? ''), dish_id: card ? card.dish_id : '', dish_name: card ? card.dish_name : (looks || pre.caption || ''), match_source: source, norm_grams: normG, actual_grams: actual, deviation_pct: deviation, tolerance_pct: tol, verdict, visual_check, visual_reason: visionEmpty ? 'vision: порожня відповідь' : (vreason || looks), tg_message_id: String(msg.message_id ?? ''), reply } }];"
+      }
+    },
+    {
+      "id": "sheet_log_append",
+      "name": "Журнал — запис",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "onError": "continueErrorOutput",
+      "position": [
+        220,
+        280
+      ],
+      "parameters": {
+        "authentication": "serviceAccount",
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_YOUR_SPREADSHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Журнал"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "ts",
+              "displayName": "ts",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "date",
+              "displayName": "date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "chef",
+              "displayName": "chef",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "chat_id",
+              "displayName": "chat_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dish_id",
+              "displayName": "dish_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dish_name",
+              "displayName": "dish_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "match_source",
+              "displayName": "match_source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "norm_grams",
+              "displayName": "norm_grams",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "actual_grams",
+              "displayName": "actual_grams",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "deviation_pct",
+              "displayName": "deviation_pct",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tolerance_pct",
+              "displayName": "tolerance_pct",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "verdict",
+              "displayName": "verdict",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "visual_check",
+              "displayName": "visual_check",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "visual_reason",
+              "displayName": "visual_reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tg_message_id",
+              "displayName": "tg_message_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {
+          "cellFormat": "RAW",
+          "handlingExtraData": "ignoreIt"
+        }
+      },
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_GOOGLE_SERVICE_ACCOUNT_CREDENTIAL_ID",
+          "name": "Google Sheets (service account)"
+        }
+      }
+    },
+    {
+      "id": "reply_chef",
+      "name": "Відповідь кухарю",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        460,
+        200
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $('Вердикт').item.json.chat_id }}",
+        "text": "={{ $('Вердикт').item.json.reply }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram bot"
+        }
+      }
+    },
+    {
+      "id": "reply_nolog",
+      "name": "Відповідь (журнал недоступний)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        460,
+        380
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $('Вердикт').item.json.chat_id }}",
+        "text": "={{ $('Вердикт').item.json.reply }}\n\n⚠️ Запис у журнал не вдався — повідомте адміністратора.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram bot"
+        }
+      }
+    },
+    {
+      "id": "sheet_log_read",
+      "name": "Журнал — читання",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "position": [
+        -740,
+        40
+      ],
+      "parameters": {
+        "authentication": "serviceAccount",
+        "resource": "sheet",
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_YOUR_SPREADSHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Журнал"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_GOOGLE_SERVICE_ACCOUNT_CREDENTIAL_ID",
+          "name": "Google Sheets (service account)"
+        }
+      }
+    },
+    {
+      "id": "stats",
+      "name": "Зведення",
+      "notes": "Why Code: Summarize could count verdicts, but the reply also needs a today/all scope switch, per-verdict lines for problem checks and one formatted Telegram text — one short node instead of Filter + Summarize + Sort + Limit + Aggregate + Set.",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "onError": "continueErrorOutput",
+      "position": [
+        -500,
+        20
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const N = '\\n';\nconst readErr = $input.all().find(i => i.json && i.json.error);\nif (readErr) throw new Error('Журнал: ' + readErr.json.error);\nconst msg = $('Telegram Trigger').first().json.message || {};\nconst rows = $input.all().map(i => i.json).filter(r => r && r.verdict);\nconst scopeAll = /(all|все|всі|усі|весь)/i.test(String(msg.text || ''));\nconst today = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Kyiv' }).format(new Date());\nconst inScope = scopeAll ? rows : rows.filter(r => String(r.date || '').slice(0, 10) === today);\nconst cnt = v => inScope.filter(r => r.verdict === v).length;\nconst devs = inScope.filter(r => r.verdict === 'OK' || r.verdict === 'BRAK').map(r => Math.abs(Number(String(r.deviation_pct).replace(',', '.')))).filter(Number.isFinite);\nconst avg = devs.length ? Math.round(devs.reduce((a, b) => a + b, 0) / devs.length * 10) / 10 : null;\nconst icon = { BRAK: '⛔️', MISMATCH: '🚫', LOWCONF: '⚠️', UNREADABLE: '❓' };\nconst failed = inScope.filter(r => r.verdict !== 'OK');\nconst lines = failed.slice(-20).reverse().map(r => (icon[r.verdict] || '•') + ' ' + String(r.ts || '').slice(5, 16) + ' ' + ([r.dish_id, r.dish_name].filter(Boolean).join(' ') || '—') + (r.actual_grams !== '' && r.actual_grams != null ? ': ' + r.actual_grams + ' г' : '') + (r.deviation_pct !== '' && r.deviation_pct != null ? ' (' + (Number(r.deviation_pct) > 0 ? '+' : '') + r.deviation_pct + '%)' : '') + (r.chef ? ' — ' + r.chef : ''));\nlet parts = ['📊 Статистика ' + (scopeAll ? 'за весь час' : 'за сьогодні (' + today + ')'), '', 'Всього перевірок: ' + inScope.length, '✅ У нормі: ' + cnt('OK'), '⛔️ Брак: ' + cnt('BRAK'), '🚫 Фото ≠ підпис: ' + cnt('MISMATCH'), '⚠️ Невизначено: ' + cnt('LOWCONF'), '❓ Нечитабельно: ' + cnt('UNREADABLE')];\nif (avg != null) parts.push('Середнє відхилення: ' + avg + '%');\nif (failed.length) { parts.push('', 'Останні проблемні (' + Math.min(20, failed.length) + ' з ' + failed.length + '):'); parts = parts.concat(lines); }\nelse parts.push('', 'Проблемних перевірок немає 👌');\nif (!scopeAll) parts.push('', '«/stats all» — за весь час.');\nreturn [{ json: { chat_id: String((msg.chat && msg.chat.id) ?? ''), reply: parts.join(N).slice(0, 3800) } }];"
+      }
+    },
+    {
+      "id": "reply_stats",
+      "name": "Відповідь статистики",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -260,
+        20
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.reply }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram bot"
+        }
+      }
+    },
+    {
+      "id": "help",
+      "name": "Допомога",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -740,
+        560
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $('Telegram Trigger').first().json.message.chat.id }}",
+        "text": "👋 Бот контролю ваги страв за техкартою.\n\n1. Сфотографуйте страву на вагах так, щоб було видно цифри на дисплеї.\n2. У підписі до фото вкажіть назву або код страви — напр. «Філадельфія з вугрем» або «R02». Можна й без підпису: тоді бот спробує визначити страву за вагою.\n3. Бот відповість: ✅ у нормі, ⛔️ брак, 🚫 фото не схоже на підпис, ⚠️ не вдалося визначити.\n\nКоманди:\n/stats — статистика за сьогодні\n/stats all — за весь час",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram bot"
+        }
+      }
+    },
+    {
+      "id": "tech_error",
+      "name": "Технічна помилка",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -20,
+        560
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $('Telegram Trigger').first().json.message.chat.id }}",
+        "text": "⚠️ Технічна помилка — перевірку не виконано. Спробуйте ще раз за хвилину; якщо повторюється, повідомте адміністратора.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram bot"
+        }
+      }
+    },
+    {
+      "id": "note",
+      "name": "Опис",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1240,
+        -300
+      ],
+      "parameters": {
+        "content": "## 🍣 Sushi QC Bot v2 — контроль ваги за техкартою\n\n**Флоу:** фото страви на вагах (+ назва або код у підписі) → Vision читає вагу і звіряє видимі ознаки з техкартою → вердикт → рядок у Google Sheets «Журнал» → відповідь кухарю.\n\n**Вердикти:** OK · BRAK (поза допуском) · MISMATCH (фото ≠ підпис) · LOWCONF (страву не визначено) · UNREADABLE (ваги не читаються).\n\n**Дані:** Google Sheets — лист `Техкарти` (норми, допуск %, видимі ознаки) і лист `Журнал`.\n**Команди:** `/stats`, `/stats all`, `/help`.",
+        "height": 300,
+        "width": 760
+      }
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Роутер",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Роутер": {
+      "main": [
+        [
+          {
+            "node": "Журнал — читання",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Техкарти — читання",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Допомога",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Техкарти — читання": {
+      "main": [
+        [
+          {
+            "node": "Підпис → кандидат",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Підпис → кандидат": {
+      "main": [
+        [
+          {
+            "node": "Vision — вага і ознаки",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Технічна помилка",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Vision — вага і ознаки": {
+      "main": [
+        [
+          {
+            "node": "Вердикт",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Технічна помилка",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Вердикт": {
+      "main": [
+        [
+          {
+            "node": "Журнал — запис",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Технічна помилка",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Журнал — запис": {
+      "main": [
+        [
+          {
+            "node": "Відповідь кухарю",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Відповідь (журнал недоступний)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Журнал — читання": {
+      "main": [
+        [
+          {
+            "node": "Зведення",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Зведення": {
+      "main": [
+        [
+          {
+            "node": "Відповідь статистики",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Технічна помилка",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Kyiv",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}

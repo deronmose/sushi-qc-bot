@@ -1,0 +1,14 @@
+# Local backups of the original prototype (contain client data) — never publish
+_backup/
+
+# Secrets
+.env
+*.env
+secrets/
+*service-account*.json
+*-sa.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
