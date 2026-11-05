@@ -1,101 +1,121 @@
-# Sushi QC Bot — dish weight control from a photo
+# Sushi QC Bot — portion weight control for a network of sushi kitchens
 
-A Telegram bot built on **n8n** that checks every portion against its recipe card. The cook zeroes the scale, takes one photo of the dish on it and adds the dish name or code as a caption. The bot then:
+A Telegram bot built on **n8n** for a chain of delivery-only sushi kitchens that all cook by **one shared set of recipe cards**. A cook zeroes the scale, photographs the portion on it and captions it with the dish name or code. The bot:
 
-1. reads the weight off the scale display with **OpenAI Vision**, including the units, and handles a container and several portions,
-2. finds the recipe card and compares the weight with the norm ± tolerance,
-3. checks that the photo actually **looks like the dish named in the caption**, such as eel on top rather than salmon. Garnish that isn't in the card doesn't count against the dish,
-4. writes a row to a **Google Sheets** journal and replies to the cook in seconds.
+1. reads the weight off the display with **OpenAI Vision** (units, container and several portions included),
+2. compares it with the recipe card, with **separate tolerances for underweight and overweight**: the customer must not be short-changed (−2.9%), a little extra is tolerated (+5%),
+3. checks that the photo **looks like the dish in the caption**,
+4. writes a row to the shared **Google Sheets** journal, tagged with the cook's kitchen, and replies in seconds.
 
-It replaces manual spot checks with a full log of every portion. The cook does one extra thing: sends a photo.
+On top of the journal, each kitchen gets a page and the owner gets a network page that update themselves. On Telegram there are `/stats` reports and a daily summary at 22:00, so the owner sees **which kitchen under- or overfills, which dishes, which cooks**.
 
-> The recipe cards in `data/techcards.csv` belong to **Nori Lab**, a fictional sushi bar made up for this demo (30 items). The bot's replies are in Ukrainian; captions may be Ukrainian or Russian.
+> Everything here is a demo: **Nori Lab** is a fictional network of four kitchens in Kyiv with made-up addresses, a 30-dish menu and two weeks of generated checks. The bot's replies are in Ukrainian; captions may be Ukrainian or Russian.
+
+## What the owner sees
+
+From the demo history (last 7 days, `/stats 7` in Telegram — the same numbers are on the «Мережа» page):
+
+```
+🏢 Мережа — за 7 днів
+V1 Nori Lab Поділ: 201 перевірок        ✅ 92.5% · ⬇️ 3 (-3.2%) · ⬆️ 0 · 🚫 3 · 🔎 2
+V2 Nori Lab Лівобережна: 189 перевірок  ✅ 58.2% · ⬇️ 62 (-4%) · ⬆️ 0 · 🚫 5 · 🔎 4
+V3 Nori Lab Печерськ: 212 перевірок     ✅ 70.8% · ⬇️ 1 (-3.5%) · ⬆️ 44 (+6.4%) · 🚫 4 · 🔎 4
+V4 Nori Lab Оболонь: 209 перевірок      ✅ 69.4% · ⬇️ 11 (-4.3%) · ⬆️ 2 (+5.2%) · 🚫 12 · 🔎 10
+Найбільше недоваги: V2 Nori Lab Лівобережна (62 з 189, середня -4%)
+Найбільше переваги: V3 Nori Lab Печерськ (44 з 212, середня +6.4%)
+```
+
+`/stats V2` then shows that kitchen's worst dishes (the Philadelphias and the Philadelphia set) and cooks.
 
 ## How it works
 
 ```mermaid
 flowchart LR
-  TG[Telegram Trigger] --> K[Sheets: Кухарі<br/>access list]
+  TG[Telegram Trigger] --> K[Telegram ID → Кухарі + Точки:<br/>kitchen, role, cached 5 min]
   K -- not listed --> NA[Reply with the user's ID]
   K --> R{Router}
-  R -- photo --> T[typing…]
-  R -- photo --> TC[Sheets: Техкарти]
-  TC --> M[Code: caption → candidate,<br/>portions, repeat check]
-  M -- same photo again --> DUP[Reply: already checked]
-  M --> V[OpenAI Vision:<br/>weight, units, container,<br/>visual check]
-  V -- empty / refusal --> V2[Vision retry,<br/>shorter prompt]
-  V --> D[Code: verdict]
-  V2 --> D
-  D --> J[Sheets: append Журнал] --> A[Reply to cook]
-  R -- /stats --> JR[Sheets: read Журнал] --> S[Code: summary] --> AS[Reply]
-  R -- anything else --> H[Help]
+  R -- photo --> TC[Техкарти, cached 10 min] --> M[kitchen lock, caption → candidate,<br/>portions, repeat check]
+  M -- other kitchen / repeat --> NL[⛔ / ♻️ not logged]
+  M --> V[OpenAI Vision: weight, units,<br/>container, visual check]
+  V -- empty / refusal --> V2[retry, shorter prompt] --> D
+  V --> D[verdict: OK / UNDER / OVER /<br/>MISMATCH / RECHECK / …]
+  D --> J[Журнал + kitchen] --> A[Reply to cook]
+  R -- /stats, 📊 --> S[own kitchen, or the network for the owner]
+  R -- 📍 Точка --> P[show / switch the kitchen]
+  R -- /report, /reload --> O[owner commands]
+  CR[Schedule 22:00] --> DR[daily report → owner + kitchen managers]
 ```
 
-There is one Vision call per photo, and a second one only if the first returns no JSON. When the caption names a dish, the prompt carries the card's `must_have` features (what must be visible) and `may_vary` (garnish, sauce, packaging — never a reason to reject).
+## Which kitchen a check goes to
+
+The kitchen is never chosen by the cook in the moment. It comes from **who sends the photo**:
+
+1. The bot takes the sender's **Telegram user ID** and finds it in `Кухарі`. Unknown IDs get «no access» and their ID to pass to the admin. A person added to the sheet is recognised from the next message.
+2. The kitchen in that row must be an **active row of `Точки`**. Otherwise nothing is logged and the person is asked to contact the admin.
+3. A cook **locked to one kitchen** always logs to it. If they write another kitchen's code in the caption («R25 V3»), the check is **not logged**: the bot explains why. This keeps the other kitchen's statistics clean and avoids a duplicate when the cook resends. The rejected photo isn't remembered, so it can be sent again without the code.
+4. People who work in several kitchens get them in `allowed_venues` («V3;V4»). They can switch with the **«📍 Точка»** button, or send one check elsewhere with a code in the caption. The owner may use any kitchen. Their replies end with «📍 V4 · …», so it's always clear where a check went.
+
+**Repeat photos.** Telegram gives every new camera shot its own file ID, so identical-looking portions never collide. Only the *same file* sent again is caught: with the same caption after a final verdict, it is not logged (♻️). With a new caption, or after an unfinished check (🔎, ❓), it is checked again (🔁).
+
+The reply keyboard under the input field always has **«📍 Точка»** and **«📊 Статистика»**; `/help` adapts to the role.
 
 ## Verdicts
 
 | Verdict | When | Reply |
 |---|---|---|
-| `OK` | weight within norm ± tolerance | ✅ У нормі |
-| `BRAK` | weight outside tolerance | ⛔️ БРАК — поза допуском |
+| `OK` | weight within −`tol_under_pct` … +`tol_over_pct` of the norm | ✅ У нормі |
+| `UNDER` | lighter than the norm allows | ⬇️ НЕДОВАГА — порція менша за норму |
+| `OVER` | heavier than the norm allows | ⬆️ ПЕРЕВАГА — порція більша за норму |
 | `MISMATCH` | the photo clearly isn't the dish in the caption (Vision confidence ≥ 0.7) | 🚫 Фото не схоже на «…» + reason |
-| `RECHECK` | the digits are unclear, or the deviation is over 30% — more likely a misread, a container or several portions than a real portion | 🔎 Перевірте фото + what to do |
-| `LOWCONF` | the dish can't be identified (no or unknown caption, several dishes weigh the same) | ⚠️ up to 3 candidates + "add the name or code" |
+| `RECHECK` | the digits are unclear, or the deviation is over 30% (more likely a misread, a container or several portions) | 🔎 Перевірте фото + what to do |
+| `LOWCONF` | the dish can't be identified | ⚠️ up to 3 candidates |
 | `UNREADABLE` | no digits on the photo, or Vision returned nothing twice | ❓ retake the photo |
 
-A visual doubt below the confidence threshold doesn't override the weight verdict; the reply gets a "⚠️ можлива невідповідність" line instead.
+## Roles and reports
 
-Commands: `/stats` (today), `/stats all` (all time), `/help`.
+| Role (`Кухарі.role`) | Sends photos | `/stats` | Also |
+|---|---|---|---|
+| `cook` | ✅ to their kitchen (and to `allowed_venues`, if set) | own kitchen | — |
+| `manager` | ✅ the same | own kitchen | daily report for their kitchen at 22:00 |
+| `owner` | ✅ to any kitchen | all kitchens side by side; `/stats V2` — one kitchen | `/report` (today's report now), `/reload` (re-read cards and cooks), daily network report at 22:00 |
 
-## What the cook can write in the caption
+Periods: `/stats` today, `/stats 7` last 7 days, `/stats all` all time. Someone who isn't on the list gets their Telegram ID to pass to the admin.
 
-| Caption | How it's matched |
+## Google Sheet
+
+| Tab | What it holds |
 |---|---|
-| `R02`, `р2`, `R-2` | dish code (Latin or Cyrillic *р*) |
-| `Філадельфія з вугрем`, `філа вугор`, `Филадельфия угорь` | full name or an alias. Ukrainian and Russian spellings fold together (і/и/ы, є/э, ь) |
-| `запечений з креветкою 8шт` | word match against names and aliases. If several dishes tie (`Дракон`, `Темпура`), the weight picks the one within tolerance, otherwise the bot lists the candidates |
-| `R06 х2`, `2 порції Каліфорнія з крабом` | several portions: the norm is multiplied |
-| `Тех карта 350 г` | a bare norm with the default tolerance (no dish card) |
-| *(nothing)* | weight only: if exactly one dish of the type seen on the photo (roll / poke / nigiri / gunkan) fits the tolerance, it is used; otherwise candidates are listed |
+| `Техкарти` | the shared recipe cards: `dish_id, dish_name, aliases, category, pieces, norm_grams, tol_under_pct, tol_over_pct, pack_grams, composition, must_have, may_vary, active` |
+| `Точки` | `venue_id, name, address, city, active` |
+| `Кухарі` | `chat_id` (the person's Telegram user ID)`, name, venue_id, venue, role, active, allowed_venues` (optional, «V3;V4») |
+| `Журнал` | one row per check: `venue_id, venue, ts, date, chef, …, net_grams, deviation_pct, tol_under_pct, tol_over_pct, verdict, visual_check, …, demo` |
+| `Мережа` | formulas: all kitchens for the last 7 days and today, the worst kitchen, the most underweight / overweight, top problem dishes. Cell B2 switches the demo rows on and off |
+| `V1 · Поділ` … `V4 · Оболонь` | formulas: one kitchen's indicators (today / 7 days / all time), top dishes and cooks with deviations, all its checks newest first |
 
-The weight logic also handles:
-- a kilogram display (`0.410`),
-- a lost decimal point (`3008` for a 300 g card is read as `300.8`),
-- a container. Its weight (`pack_grams`) is subtracted only when Vision sees one **and** that brings the reading closer to the norm. The reply shows the subtraction.
-
-The same photo sent twice is rejected, using the Telegram `file_unique_id` kept in workflow static data.
-
-## Data model — one Google Sheet, three tabs
-
-**`Техкарти`** (recipe cards, the source of truth): `dish_id, dish_name, aliases, category, pieces, norm_grams, tolerance_pct, pack_grams, composition, must_have, may_vary, active`.
-- `must_have` is what identifies the dish on the plate, such as *"зверху темно-коричневий вугор"*.
-- `may_vary` is what may or may not be there, such as *"соус унагі; кунжут; ікра"*.
-- `active = FALSE` hides a dish without deleting it.
-
-**`Журнал`** (one row per check): `ts, date, chef, chat_id, dish_id, dish_name, match_source, portions, norm_grams, scale_grams, tare_grams, net_grams, deviation_pct, tolerance_pct, verdict, visual_check, visual_reason, digits_confidence, photo_uid, tg_message_id`.
-
-**`Кухарі`** (who may use the bot): `chat_id, name, venue, active`. An unknown user gets a reply with their Telegram ID to pass to the admin.
-
-The sheet doubles as the admin panel. The kitchen manager edits norms, tolerances and the cook list in the sheet, with no code changes.
+The pages are generated by `tools/sheet-pages.js`. They read the journal, so nothing has to be maintained by hand.
 
 ## Repository
 
 ```
-src/                          Code node sources: match-caption.js, verdict.js, stats.js
-tools/build-workflow.js       assembles workflows/sushi-qc-bot.json from src/ (node tools/build-workflow.js)
+src/                          Code node sources (cook, cooks-cache, point, match-caption, verdict, stats, report-now, daily, reset-cache, report-lib)
+tools/build-workflow.js       assembles workflows/sushi-qc-bot.json from src/
+tools/sheet-pages.js          formulas for «Мережа» and the kitchen pages; `node tools/sheet-pages.js ";"` writes them as CSV
+tools/gen-demo-history.js     deterministic two-week demo journal → data/demo_journal.csv
 workflows/sushi-qc-bot.json   n8n workflow (credentials and spreadsheet ID are placeholders)
-data/techcards.csv            demo recipe cards — 30 dishes, composition sums to the norm
-data/journal_template.csv     journal header row
-data/cooks_template.csv       access list template
-tests/run-scenarios.js        offline tests of the decision logic (no n8n or API keys needed)
+data/                         techcards, venues, cooks and journal templates, demo journal, page CSVs
+tests/run-scenarios.js        78 offline tests (no n8n or API keys needed)
 docs/setup.md                 step-by-step installation
 docs/recognition-qa.ru.md     recognition QA: user questions, failure modes, fixes, before/after (in Russian)
 ```
 
 ## Setup
 
-The short version: create a Telegram bot, an OpenAI key and a Google service account. Import the three CSVs as tabs `Техкарти`, `Журнал` and `Кухарі`. Import the workflow, then set the three credentials and the spreadsheet ID and activate it. Full steps are in **[docs/setup.md](docs/setup.md)**.
+Create a Telegram bot, an OpenAI key and a Google service account. Then:
+1. Import the CSVs as tabs and the page CSVs as formula pages.
+2. Import the workflow, set the three credentials and the spreadsheet ID, and activate it.
+3. Add yourself to `Кухарі` as `owner`.
+
+Full steps are in **[docs/setup.md](docs/setup.md)**.
 
 ## Tests
 
@@ -103,30 +123,26 @@ The short version: create a Telegram bot, an OpenAI key and a Google service acc
 node tests/run-scenarios.js
 ```
 
-The tests run the Code node sources from `src/` against the recipe cards, with Telegram and Vision replaced by fixtures. There are 36 checks covering:
-- captions: codes, aliases, Russian spelling, generic words,
-- weight: units, portions, container, the tolerance edge (2.94% is outside 2.9%), a lost decimal point,
-- what Vision said: unclear digits, implausible deviation, a confident and an unsure visual mismatch, an unreadable display, an empty answer,
-- a repeated photo and `/stats`.
+The 78 checks run the Code node sources (and the built workflow) against the recipe cards, with Telegram and Vision replaced by fixtures:
+- underweight and overweight at the edges of the asymmetric tolerance;
+- captions: codes, aliases, Russian spelling, generic words;
+- units, portions, container, misreads, the visual check, repeat photos and corrections;
+- the kitchen lock: another kitchen's code, the own code, `allowed_venues`, the owner, unknown and inactive kitchens, lookup by Telegram ID;
+- «📍 Точка» switching, caches, role-aware help, roles in `/stats` and `/report`;
+- every Telegram message is sent as HTML with names and replies escaped;
+- the daily report going to the right people;
+- every one of the 1 495 weighed demo rows agrees with the verdict rule.
 
-How the bot behaves on real photos and degraded copies of them is measured on a separate n8n eval stand. The results are in [docs/recognition-qa.ru.md](docs/recognition-qa.ru.md).
+How the bot behaves on real photos is measured on a separate n8n eval stand: [docs/recognition-qa.ru.md](docs/recognition-qa.ru.md).
 
 ## Limits
 
-- **Twins can't be told apart from the photo alone.** Two dishes that look the same and weigh the same, but differ only inside (fresh vs. lightly salted salmon, tempura with salmon vs. eel), need a caption. The demo menu includes such pairs on purpose.
-- **Vision can misread blurry digits with full confidence.** The model's self-reported `digits_confidence` is not reliable. Deviations over 30% become `RECHECK` instead of `BRAK`, but a misread that lands within 30% can still produce a wrong `BRAK`. A second, zoomed-in reading of the display is the planned fix.
-- **Near-identical dishes** with similar coatings are not always caught as a mismatch. Reference photos per dish are the planned fix.
-- **Google Sheets read quota.** Every message reads the cook list and every photo reads the recipe cards. Bursts of several photos a minute can hit the quota; caching the cards is the planned fix.
-- **Photo time.** Telegram strips EXIF from compressed photos, so the journal records the time the photo was sent. Sending the photo as a file keeps the original.
-- **Hosting.** The demo runs on a local n8n behind a tunnel. A real kitchen needs a permanent host (n8n Cloud or a small VPS).
-- **Cost.** About one gpt-4o vision call per photo, a fraction of a cent. At ~30 portions a day per venue this is negligible.
-
-## Possible next steps
-
-- Inline buttons with the 2–3 candidates, so an ambiguous photo is resolved with one tap.
-- Reply to the bot's message with a code to re-check the same photo; album support.
-- Reference photos per dish and a second display reading, for near-identical dishes and blurry digits.
-- Scheduled daily reports and a dashboard on top of the journal: % in norm, worst dishes, by cook or shift.
+- **Twins can't be told apart from the photo alone.** Dishes that look and weigh the same but differ inside need a caption.
+- **Vision can misread blurry digits with full confidence.** Deviations over 30% become `RECHECK`, but a misread within 30% can still produce a wrong `UNDER`/`OVER`. A second, zoomed-in reading is the planned fix.
+- **Google Sheets read quota.** The recipe cards and the cook list are cached (10 and 5 minutes), and every check writes one journal row. For several busy kitchens, a database instead of a sheet is the next step.
+- **Hosting.** The demo runs on a local n8n behind a tunnel, so the 22:00 report only arrives while the computer is on. A real network needs a permanent host (n8n Cloud or a small VPS).
+- **Photo time.** Telegram strips EXIF from compressed photos; the journal records the time the photo was sent.
+- **The kitchen is trusted to the profile.** The bot can't see where a photo was physically taken. A cook working in two kitchens who forgets to switch logs to the last one chosen. The «📍 V…» line in every reply is the reminder.
 
 ## License
 

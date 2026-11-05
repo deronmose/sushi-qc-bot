@@ -1,17 +1,49 @@
-// Code node «Підпис → кандидат» — runs once for all items (input: rows of the «Техкарти» sheet).
-// Matches the cook's caption to a recipe card, parses portions («х2»), checks for a re-sent photo
-// and builds the Vision prompt. Output: one item with the photo binary passed through.
+// Code node «Підпис → кандидат» — runs once for all items. Input: rows of the «Техкарти» sheet, or one
+// {fresh: true} item when the cached cards (workflow static data, refreshed every 10 minutes or by /reload) are valid.
+// Picks the kitchen (profile or a code in the caption, with the lock check), matches the cook's caption to a recipe
+// card, parses portions («х2»), checks for a re-sent photo and builds the Vision prompt.
+// Output: one item with the photo binary passed through; a non-empty stop_reply means «answer this, log nothing».
 
-const readErr = $input.all().find(i => i.json && i.json.error);
-if (readErr) throw new Error('Техкарти: ' + readErr.json.error);
+const sd = $getWorkflowStaticData('global');
+const inRows = $input.all().map(i => i.json);
+const readErr = inRows.find(r => r && r.error);
+if (readErr) throw new Error('Техкарти: ' + readErr.error);
+let sheetRows;
+if (inRows.some(r => r && r.dish_id)) { sheetRows = inRows; sd.cards = { at: Date.now(), rows: inRows }; }
+else if (sd.cards && sd.cards.rows) sheetRows = sd.cards.rows;
+else throw new Error('Техкарти: немає даних');
 
 const trig = $('Telegram Trigger').first();
 const msg = trig.json.message || {};
 const rawCaption = String(msg.caption || '').trim();
+let cook = null;
+try { cook = $('Кухар').first().json.cook || null; } catch (e) { /* only in offline tests */ }
+
+// Which kitchen gets this check. By default — the kitchen in the sender's profile (Telegram ID → «Кухарі»).
+// A kitchen code in the caption («R02 V3») sends this one check elsewhere, but only for the owner and for people
+// who have that kitchen in allowed_venues. A cook locked to one kitchen who writes another kitchen's code gets a
+// warning and nothing is logged — so the wrong kitchen's statistics are not spoiled and no duplicate appears later.
+const VENUE_RE = /(?:^|[\s,;:(])📍?\s*[VvВв](\d{1,2})(?![\d\p{L}])/u;
+const vm = rawCaption.match(VENUE_RE);
+const wantVenue = vm ? 'V' + Number(vm[1]) : null;
+let venueId = cook ? cook.venue_id : '', venueName = cook ? cook.venue : '', stopReply = '';
+if (cook) {
+  const known = cook.venues && cook.venues.length ? cook.venues : null;
+  const own = cook.venue_id + (cook.venue ? ' · ' + cook.venue : '');
+  const target = known && wantVenue ? known.find((v) => v.id === wantVenue) : null;
+  if (cook.venue_ok === false) {
+    stopReply = '⛔ Ваш профіль не прив\'язано до активної точки (у листі «Кухарі»: «' + (cook.venue_id || '—') + '»).\nПеревірку не записано — зверніться до адміністратора.';
+  } else if (wantVenue && wantVenue !== cook.venue_id) {
+    if (known && !target) stopReply = '⛔ Точки ' + wantVenue + ' немає серед активних.\nПеревірку не записано. Надішліть фото без коду точки — воно піде у вашу точку (' + own + ').';
+    else if (cook.role === 'owner' || (cook.allowed || []).includes(wantVenue)) { venueId = wantVenue; venueName = target ? target.name : wantVenue; }
+    else stopReply = '⛔ Ви закріплені за точкою ' + own + ', а в підписі вказано ' + wantVenue + (target ? ' · ' + target.name : '') + '.\n'
+      + 'Перевірку не записано, щоб не зіпсувати статистику точок. Надішліть фото ще раз без коду точки — воно піде у вашу точку.';
+  }
+}
 
 const isActive = v => v === true || ['TRUE', '1', 'ТАК', 'YES'].includes(String(v ?? '').trim().toUpperCase());
-const num = v => Number(String(v ?? '').replace(',', '.'));
-const cards = $input.all().map(i => i.json)
+const num = v => (v === '' || v == null) ? NaN : Number(String(v).replace(',', '.'));
+const cards = sheetRows
   .filter(c => c && c.dish_id && c.dish_name && isActive(c.active))
   .map(c => ({
     dish_id: String(c.dish_id).trim().toUpperCase(),
@@ -19,7 +51,8 @@ const cards = $input.all().map(i => i.json)
     aliases: String(c.aliases || ''),
     category: String(c.category || ''),
     norm_grams: num(c.norm_grams),
-    tolerance_pct: num(c.tolerance_pct),
+    tol_under: num(c.tol_under_pct ?? c.tolerance_pct),
+    tol_over: num(c.tol_over_pct ?? c.tolerance_pct),
     pack_grams: Number.isFinite(num(c.pack_grams)) ? num(c.pack_grams) : 0,
     must_have: String(c.must_have || c.visual_features || ''),
     may_vary: String(c.may_vary || ''),
@@ -29,10 +62,11 @@ if (!cards.length) throw new Error('Техкарти: немає жодної а
 
 // Portions: «х2», «x2», «2х», «2 порції» → the norm is multiplied.
 const PORTIONS_RE = /(?:^|\s)(?:[xх×*]\s?(\d{1,2})|(\d{1,2})\s?[xх×])(?=\s|$)|(\d{1,2})\s*(?:порц\S*|porc\S*)/i;
-const pm = rawCaption.match(PORTIONS_RE);
+const noVenue = vm ? rawCaption.replace(VENUE_RE, ' ').trim() : rawCaption;
+const pm = noVenue.match(PORTIONS_RE);
 const pn = pm ? Number(pm[1] || pm[2] || pm[3]) : 1;
 const portions = pn >= 1 && pn <= 10 ? pn : 1;
-const caption = pm ? rawCaption.replace(PORTIONS_RE, ' ').trim() : rawCaption;
+const caption = pm ? noVenue.replace(PORTIONS_RE, ' ').trim() : noVenue;
 
 // Ukrainian and Russian spellings fold to one form: «Філадельфія» = «Филадельфия», «Зелений» = «Зеленый».
 const norm = s => String(s || '').toLowerCase()
@@ -67,11 +101,20 @@ if (caption) {
   }
 }
 
-// Same photo sent again? (uids are recorded by «Вердикт» after a completed check)
+// Same photo FILE sent again? Telegram gives every new camera shot its own file_unique_id, so identical-looking
+// portions never collide — only a re-sent file does. A re-sent file with a different caption (or after an
+// unfinished check) is a correction and is checked again; the same file with the same caption after a final
+// verdict is stopped. Entries are recorded by «Вердикт».
 const photos = msg.photo || [];
 const photoUid = String((photos.length ? photos[photos.length - 1].file_unique_id : (msg.document && msg.document.file_unique_id)) || '');
-const seen = ($getWorkflowStaticData('global').seen || {});
-const duplicateOf = photoUid && seen[photoUid] ? seen[photoUid] : '';
+const seenRaw = photoUid ? (sd.seen || {})[photoUid] : null;
+// older records are a bare timestamp without caption or verdict — treat them as unfinished, so they can be re-checked
+const seen = seenRaw ? (typeof seenRaw === 'string' ? { ts: seenRaw, caption: null, final: false } : seenRaw) : null;
+const sameCaption = seen && (seen.caption === null || norm(seen.caption) === norm(rawCaption));
+const duplicateOf = !stopReply && seen && seen.final && sameCaption ? seen.ts : '';
+const recheckOf = seen && !duplicateOf ? seen.ts : '';
+if (duplicateOf) stopReply = '♻️ Це саме фото з тим самим підписом уже перевіряли (' + duplicateOf + ').\n'
+  + 'Нова порція — сфотографуйте її ще раз. Помилилися з підписом — надішліть це фото з правильним підписом, і бот перевірить його знову.';
 
 const base = 'Ти допомагаєш кухні ресторану контролювати вагу порцій: на фото — страва, яку кухар зважив на кухонних вагах. '
   + '1) Дисплей ваг: перепиши показання у display_text (з крапкою чи комою, напр. 384.8 або 0.410) і поверни число в display_value. '
@@ -99,7 +142,8 @@ return [{
     caption: rawCaption, card, portions,
     match_source: card ? 'caption' : (normFromCaption ? 'norm' : ''),
     caption_candidates: captionCandidates, norm_from_caption: normFromCaption,
-    photo_uid: photoUid, duplicate_of: duplicateOf,
+    photo_uid: photoUid, duplicate_of: duplicateOf, recheck_of: recheckOf,
+    venue_id: venueId, venue: venueName, stop_reply: stopReply,
     cards, vision_prompt: base + check + fmt, vision_prompt_retry: retryPrompt,
   },
   binary: trig.binary,

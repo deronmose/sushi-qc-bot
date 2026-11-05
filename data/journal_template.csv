@@ -1,1 +1,1 @@
-ts,date,chef,chat_id,dish_id,dish_name,match_source,portions,norm_grams,scale_grams,tare_grams,net_grams,deviation_pct,tolerance_pct,verdict,visual_check,visual_reason,digits_confidence,photo_uid,tg_message_id
+venue_id,venue,ts,date,chef,chat_id,dish_id,dish_name,match_source,portions,norm_grams,scale_grams,tare_grams,net_grams,deviation_pct,tol_under_pct,tol_over_pct,verdict,visual_check,visual_reason,digits_confidence,photo_uid,tg_message_id,demo

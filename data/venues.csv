@@ -1,0 +1,5 @@
+venue_id,name,address,city,active
+V1,Nori Lab Поділ,вул. Вигадана Набережна 12,Київ,TRUE
+V2,Nori Lab Лівобережна,просп. Тестовий 48,Київ,TRUE
+V3,Nori Lab Печерськ,вул. Демонстраційна 7,Київ,TRUE
+V4,Nori Lab Оболонь,вул. Прикладна 31,Київ,TRUE

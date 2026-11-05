@@ -1,5 +1,5 @@
 {
-  "name": "Sushi QC Bot — dish weight control against recipe cards",
+  "name": "Sushi QC Bot — dish weight control for a network of kitchens",
   "nodes": [
     {
       "id": "tg_trigger",
@@ -7,7 +7,7 @@
       "type": "n8n-nodes-base.telegramTrigger",
       "typeVersion": 1.2,
       "position": [
-        -1700,
+        -2380,
         300
       ],
       "parameters": {
@@ -26,16 +26,100 @@
       }
     },
     {
+      "id": "cooks_cache",
+      "name": "Кеш кухарів?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2160,
+        300
+      ],
+      "notes": "Why Code: state across runs: the cook and kitchen lists are cached in workflow static data for 5 minutes to stay within the Google Sheets read quota; a sender missing from the cache re-reads at once.",
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Code node «Кеш кухарів?» — can the cached cook and kitchen lists be used? Yes while they are younger than\n// 5 minutes AND the sender is an active person in them. A sender missing from the cache (someone just added to\n// «Кухарі» or switched back on) re-reads the sheet at once instead of waiting for the cache to expire.\nconst sd = $getWorkflowStaticData('global');\nconst msg = $('Telegram Trigger').first().json.message || {};\nconst id = String((msg.from && msg.from.id) ?? (msg.chat && msg.chat.id) ?? '');\nconst isActive = (v) => v === true || ['TRUE', '1', 'ТАК', 'YES'].includes(String(v ?? '').trim().toUpperCase());\nconst c = sd.cooks;\nconst young = !!(c && c.rows && Date.now() - c.at < 5 * 60 * 1000);\nconst known = young && c.rows.some((r) => String(r.chat_id).trim() === id && isActive(r.active));\nreturn [{ json: { fresh: known } }];\n"
+      }
+    },
+    {
+      "id": "cooks_fresh",
+      "name": "Кухарі з кешу?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -1940,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cf",
+              "leftValue": "={{ $json.fresh }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "sheet_venues_cache",
+      "name": "Точки — для кешу",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -1720,
+        440
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "authentication": "serviceAccount",
+        "resource": "sheet",
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_YOUR_SPREADSHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Точки"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_GOOGLE_SERVICE_ACCOUNT_CREDENTIAL_ID",
+          "name": "Google Sheets (service account)"
+        }
+      }
+    },
+    {
       "id": "sheet_cooks",
       "name": "Кухарі — читання",
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4.7,
       "position": [
-        -1480,
-        300
+        -1500,
+        440
       ],
       "alwaysOutputData": true,
       "onError": "continueRegularOutput",
+      "executeOnce": true,
       "parameters": {
         "authentication": "serviceAccount",
         "resource": "sheet",
@@ -60,67 +144,28 @@
       }
     },
     {
-      "id": "cooks_active",
-      "name": "Активні кухарі",
-      "type": "n8n-nodes-base.filter",
-      "typeVersion": 2.2,
+      "id": "cook",
+      "name": "Кухар",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [
-        -1260,
+        -1280,
         300
       ],
+      "onError": "continueErrorOutput",
+      "notes": "Why Code: looks up the sender (Telegram user ID → kitchen and role), checks that the kitchen is an active row of «Точки», and keeps both lists cached — state across runs.",
       "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "loose",
-            "version": 2
-          },
-          "conditions": [
-            {
-              "id": "ca",
-              "leftValue": "={{ String($json.active).trim().toUpperCase() }}",
-              "rightValue": "TRUE",
-              "operator": {
-                "type": "string",
-                "operation": "equals"
-              }
-            }
-          ],
-          "combinator": "and"
-        },
-        "options": {}
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Code node «Кухар» — who is writing and which kitchen they belong to.\n// The sender is identified by the Telegram user ID (message.from.id) against the chat_id column of «Кухарі».\n// Input: rows of the «Кухарі» sheet (with the «Точки» rows read just before it), or one {fresh: true} item when\n// the cached lists (workflow static data, refreshed every 5 minutes, after «📍 Точка» or by /reload) are valid.\n// Output: { found, cook: { chat_id, name, venue_id, venue, venue_ok, venues, role, allowed, can_switch } }.\nconst sd = $getWorkflowStaticData('global');\nconst inRows = $input.all().map((i) => i.json);\nconst readErr = inRows.find((r) => r && r.error);\nif (readErr) throw new Error('Кухарі: ' + readErr.error);\nconst isActive = (v) => v === true || ['TRUE', '1', 'ТАК', 'YES'].includes(String(v ?? '').trim().toUpperCase());\n\nlet rows, venues = null;\nif (inRows.length === 1 && inRows[0].fresh === true && sd.cooks) ({ rows, venues = null } = sd.cooks);\nelse {\n  rows = inRows.filter((r) => r && r.chat_id !== undefined && r.chat_id !== '');\n  let vRows = null;\n  try { vRows = $('Точки — для кешу').all().map((i) => i.json); } catch (e) { /* the kitchen list was not read */ }\n  if (vRows) {\n    const vErr = vRows.find((r) => r && r.error);\n    if (vErr) throw new Error('Точки: ' + vErr.error);\n    venues = vRows.filter((v) => v && v.venue_id && isActive(v.active))\n      .map((v) => ({ id: String(v.venue_id).trim().toUpperCase(), name: String(v.name || v.venue_id).trim() }));\n  }\n  sd.cooks = { at: Date.now(), rows, venues };\n}\n\nconst msg = $('Telegram Trigger').first().json.message || {};\nconst id = String((msg.from && msg.from.id) ?? (msg.chat && msg.chat.id) ?? '');\nconst r = rows.find((x) => String(x.chat_id).trim() === id && isActive(x.active));\nconst role = r ? String(r.role || '').trim().toLowerCase() : '';\n// optional column allowed_venues («V1;V2») — kitchens this person may also send checks to; the owner may use any\nconst allowed = r ? String(r.allowed_venues || '').split(/[;, ]+/).map((v) => v.trim().toUpperCase()).filter(Boolean) : [];\nconst venueId = r ? String(r.venue_id || '').trim().toUpperCase() : '';\nconst home = venues ? venues.find((v) => v.id === venueId) : null;\nconst cook = r ? {\n  chat_id: id,\n  name: String(r.name || ''),\n  venue_id: venueId,\n  venue: home ? home.name : String(r.venue || r.venue_id || ''),\n  // the kitchen in the profile must be an active row of «Точки», otherwise nothing is logged (unknown when the list was not read)\n  venue_ok: venues ? !!home : true,\n  venues: venues || [],\n  role: ['owner', 'manager', 'cook'].includes(role) ? role : 'cook',\n  allowed,\n  can_switch: role === 'owner' || allowed.length > 1,\n} : null;\nreturn [{ json: { found: !!cook, cook } }];\n"
       }
     },
     {
-      "id": "cooks_ids",
-      "name": "Список ID",
-      "type": "n8n-nodes-base.aggregate",
-      "typeVersion": 1,
-      "position": [
-        -1040,
-        300
-      ],
-      "alwaysOutputData": true,
-      "parameters": {
-        "aggregate": "aggregateIndividualFields",
-        "fieldsToAggregate": {
-          "fieldToAggregate": [
-            {
-              "fieldToAggregate": "chat_id"
-            }
-          ]
-        },
-        "options": {}
-      }
-    },
-    {
-      "id": "access",
-      "name": "Доступ?",
+      "id": "known",
+      "name": "Є в списку?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
-        -820,
+        -1060,
         300
       ],
       "parameters": {
@@ -133,13 +178,13 @@
           },
           "conditions": [
             {
-              "id": "ac",
-              "leftValue": "={{ ($json.chat_id || []).map(String) }}",
-              "rightValue": "={{ String($('Telegram Trigger').first().json.message.chat.id) }}",
+              "id": "kn",
+              "leftValue": "={{ $json.found }}",
+              "rightValue": "",
               "operator": {
-                "type": "array",
-                "operation": "contains",
-                "rightType": "any"
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
               }
             }
           ],
@@ -154,16 +199,17 @@
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.2,
       "position": [
-        -600,
-        520
+        -840,
+        560
       ],
       "parameters": {
         "resource": "message",
         "operation": "sendMessage",
         "chatId": "={{ $('Telegram Trigger').first().json.message.chat.id }}",
-        "text": "=👋 Вас ще немає в списку кухарів.\nВаш Telegram ID: {{ $('Telegram Trigger').first().json.message.chat.id }}\nПередайте його адміністратору — після цього надсилайте фото страв на вагах.",
+        "text": "=👋 Вас ще немає в списку кухарів.\nВаш Telegram ID: {{ String(($('Telegram Trigger').first().json.message.from?.id ?? $('Telegram Trigger').first().json.message.chat.id) ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') }}\nПередайте його адміністратору — він додасть вас у лист «Кухарі» з вашою точкою.",
         "additionalFields": {
-          "appendAttribution": false
+          "appendAttribution": false,
+          "parse_mode": "HTML"
         }
       },
       "credentials": {
@@ -179,7 +225,7 @@
       "type": "n8n-nodes-base.switch",
       "typeVersion": 3.2,
       "position": [
-        -600,
+        -840,
         280
       ],
       "parameters": {
@@ -202,12 +248,111 @@
                       "type": "string",
                       "operation": "startsWith"
                     }
+                  },
+                  {
+                    "id": "r-stats2",
+                    "leftValue": "={{ $('Telegram Trigger').first().json.message.text }}",
+                    "rightValue": "📊",
+                    "operator": {
+                      "type": "string",
+                      "operation": "startsWith"
+                    }
+                  }
+                ],
+                "combinator": "or"
+              },
+              "renameOutput": true,
+              "outputKey": "stats"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r-report",
+                    "leftValue": "={{ $('Telegram Trigger').first().json.message.text }}",
+                    "rightValue": "/report",
+                    "operator": {
+                      "type": "string",
+                      "operation": "startsWith"
+                    }
                   }
                 ],
                 "combinator": "and"
               },
               "renameOutput": true,
-              "outputKey": "stats"
+              "outputKey": "report"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r-reload",
+                    "leftValue": "={{ $('Telegram Trigger').first().json.message.text }}",
+                    "rightValue": "/reload",
+                    "operator": {
+                      "type": "string",
+                      "operation": "startsWith"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "reload"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r-pt1",
+                    "leftValue": "={{ $('Telegram Trigger').first().json.message.text }}",
+                    "rightValue": "/point",
+                    "operator": {
+                      "type": "string",
+                      "operation": "startsWith"
+                    }
+                  },
+                  {
+                    "id": "r-pt2",
+                    "leftValue": "={{ $('Telegram Trigger').first().json.message.text }}",
+                    "rightValue": "📍",
+                    "operator": {
+                      "type": "string",
+                      "operation": "startsWith"
+                    }
+                  },
+                  {
+                    "id": "r-pt3",
+                    "leftValue": "={{ $('Telegram Trigger').first().json.message.text }}",
+                    "rightValue": "/точка",
+                    "operator": {
+                      "type": "string",
+                      "operation": "startsWith"
+                    }
+                  }
+                ],
+                "combinator": "or"
+              },
+              "renameOutput": true,
+              "outputKey": "point"
             },
             {
               "conditions": {
@@ -252,12 +397,543 @@
       }
     },
     {
+      "id": "sheet_log_read",
+      "name": "Журнал — читання",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -600,
+        -360
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "authentication": "serviceAccount",
+        "resource": "sheet",
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_YOUR_SPREADSHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Журнал"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_GOOGLE_SERVICE_ACCOUNT_CREDENTIAL_ID",
+          "name": "Google Sheets (service account)"
+        }
+      }
+    },
+    {
+      "id": "stats",
+      "name": "Зведення",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -380,
+        -360
+      ],
+      "onError": "continueErrorOutput",
+      "notes": "Why Code: role-aware report text: own kitchen for cooks and managers, the network or one kitchen for the owner, with per-verdict counts, averages and top dishes/cooks — one node instead of a Filter + Summarize + Sort + Aggregate + Set chain per report type.",
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ===== report-lib — shared by «Зведення», «Звіт на вимогу» and «Щоденний звіт» (tools/build-workflow.js inlines it) =====\nconst RL = (() => {\n  const INCLUDE_DEMO = true; // the demo history counts in reports; set to false for a real kitchen\n  const num = (v) => { if (v === '' || v == null) return null; const n = Number(String(v).replace(',', '.')); return Number.isFinite(n) ? n : null; };\n  const isDemo = (r) => r.demo === true || String(r.demo).trim().toUpperCase() === 'TRUE';\n  const kyivDate = (d) => new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Kyiv' }).format(d);\n  const today = () => kyivDate(new Date());\n  const daysAgo = (n) => kyivDate(new Date(Date.now() - n * 86400000));\n  // v3 rows still say BRAK — split by the sign of the deviation\n  const verdictOf = (r) => { const v = String(r.verdict || ''); if (v !== 'BRAK') return v; const d = num(r.deviation_pct); return d != null && d < 0 ? 'UNDER' : 'OVER'; };\n\n  function filterRows(rows, { venue = null, from = null, includeDemo = INCLUDE_DEMO } = {}) {\n    return rows.filter((r) => r && r.verdict\n      && (!venue || String(r.venue_id).trim().toUpperCase() === venue)\n      && (!from || String(r.date || '').slice(0, 10) >= from)\n      && (includeDemo || !isDemo(r)));\n  }\n  function summarize(rows) {\n    const s = { total: rows.length, OK: 0, UNDER: 0, OVER: 0, MISMATCH: 0, RECHECK: 0, LOWCONF: 0, UNREADABLE: 0 };\n    const under = [], over = [];\n    for (const r of rows) {\n      const v = verdictOf(r); if (v in s) s[v]++;\n      const d = num(r.deviation_pct);\n      if (v === 'UNDER' && d != null) under.push(d);\n      if (v === 'OVER' && d != null) over.push(d);\n    }\n    const avg = (a) => (a.length ? Math.round(a.reduce((x, y) => x + y, 0) / a.length * 10) / 10 : null);\n    s.okPct = s.total ? Math.round(s.OK / s.total * 1000) / 10 : null;\n    s.avgUnder = avg(under); s.avgOver = avg(over);\n    return s;\n  }\n  function top(rows, keyFn, n = 3) {\n    const m = new Map();\n    for (const r of rows) {\n      const v = verdictOf(r); if (!['UNDER', 'OVER', 'MISMATCH'].includes(v)) continue;\n      const k = keyFn(r); if (!k) continue;\n      const e = m.get(k) || { k, n: 0, UNDER: 0, OVER: 0, MISMATCH: 0 }; e.n++; e[v]++; m.set(k, e);\n    }\n    return [...m.values()].sort((a, b) => b.n - a.n).slice(0, n);\n  }\n  const pct = (v) => (v == null ? '—' : v + '%');\n  const sgn = (v) => (v == null ? '' : (v > 0 ? '+' : '') + v + '%');\n  const kinds = (e) => [e.UNDER ? '⬇️' + e.UNDER : '', e.OVER ? '⬆️' + e.OVER : '', e.MISMATCH ? '🚫' + e.MISMATCH : ''].filter(Boolean).join(' ');\n  const line = (s) => `✅ ${pct(s.okPct)} · ⬇️ ${s.UNDER}${s.UNDER ? ' (' + sgn(s.avgUnder) + ')' : ''} · ⬆️ ${s.OVER}${s.OVER ? ' (' + sgn(s.avgOver) + ')' : ''} · 🚫 ${s.MISMATCH} · 🔎 ${s.RECHECK}`;\n  const dishKey = (r) => [r.dish_id, r.dish_name].filter(Boolean).join(' ');\n\n  function venueReport(rows, title, period) {\n    const s = summarize(rows);\n    const L = [`📊 ${title} — ${period}`, '', `Перевірок: ${s.total}`,\n      `✅ У нормі: ${s.OK} (${pct(s.okPct)})`,\n      `⬇️ Недовага: ${s.UNDER}${s.UNDER ? ' · середня ' + sgn(s.avgUnder) : ''}`,\n      `⬆️ Перевага: ${s.OVER}${s.OVER ? ' · середня ' + sgn(s.avgOver) : ''}`,\n      `🚫 Фото ≠ підпис: ${s.MISMATCH}`, `🔎 Перевірити: ${s.RECHECK}`, `⚠️ Не визначено / ❓ нечитабельно: ${s.LOWCONF + s.UNREADABLE}`];\n    const td = top(rows, dishKey);\n    if (td.length) { L.push('', 'Страви з відхиленнями:'); for (const e of td) L.push(`• ${e.k}: ${e.n} (${kinds(e)})`); }\n    const tc = top(rows, (r) => r.chef);\n    if (tc.length) { L.push('', 'Кухарі з відхиленнями:'); for (const e of tc) L.push(`• ${e.k}: ${e.n} (${kinds(e)})`); }\n    if (!s.total) L.push('', 'Перевірок за цей період немає.');\n    return L.join('\\n');\n  }\n  function networkReport(rows, period) {\n    const names = new Map();\n    for (const r of rows) if (r.venue_id) names.set(String(r.venue_id).trim().toUpperCase(), String(r.venue || r.venue_id));\n    const per = [...names.entries()].sort((a, b) => a[0].localeCompare(b[0]))\n      .map(([id, name]) => ({ id, name, s: summarize(rows.filter((r) => String(r.venue_id).trim().toUpperCase() === id)) }));\n    const L = [`🏢 Мережа — ${period}`, ''];\n    for (const v of per) L.push(`${v.id} ${v.name}: ${v.s.total} перевірок`, '   ' + line(v.s));\n    const all = summarize(rows);\n    L.push('', `Разом: ${all.total} · ${line(all)}`);\n    const withData = per.filter((v) => v.s.total >= 5);\n    if (withData.length > 1) {\n      const by = (f) => withData.slice().sort((a, b) => f(b) - f(a))[0];\n      const worst = by((v) => -(v.s.okPct ?? 0));\n      const under = by((v) => v.s.UNDER / v.s.total);\n      const over = by((v) => v.s.OVER / v.s.total);\n      L.push('', `Найнижчий % у нормі: ${worst.id} ${worst.name} (${pct(worst.s.okPct)})`);\n      if (under.s.UNDER) L.push(`Найбільше недоваги: ${under.id} ${under.name} (${under.s.UNDER} з ${under.s.total}, середня ${sgn(under.s.avgUnder)})`);\n      if (over.s.OVER) L.push(`Найбільше переваги: ${over.id} ${over.name} (${over.s.OVER} з ${over.s.total}, середня ${sgn(over.s.avgOver)})`);\n    }\n    const td = top(rows, dishKey);\n    if (td.length) { L.push('', 'Страви з відхиленнями по мережі:'); for (const e of td) L.push(`• ${e.k}: ${e.n} (${kinds(e)})`); }\n    if (!all.total) L.push('Перевірок за цей період немає.');\n    return L.join('\\n');\n  }\n  function periodFrom(text) {\n    const t = String(text || '').toLowerCase();\n    if (/(all|все|всі|весь)/.test(t)) return { from: null, label: 'за весь час' };\n    if (/(^|\\s)7(\\s|$)|тиж|нед|week/.test(t)) return { from: daysAgo(6), label: 'за 7 днів' };\n    return { from: today(), label: 'за сьогодні (' + today() + ')' };\n  }\n  function venueFrom(text) {\n    const m = String(text || '').match(/(?:^|\\s)[vв]\\s?(\\d{1,2})(?!\\d)/i);\n    return m ? 'V' + Number(m[1]) : null;\n  }\n  return { INCLUDE_DEMO, filterRows, summarize, venueReport, networkReport, periodFrom, venueFrom, today, verdictOf };\n})();\n// ===== end report-lib =====\n\n// Code node «Зведення» — /stats. Input: rows of the «Журнал» sheet. report-lib (RL) is inlined above by the build.\n//   cook / manager → own kitchen; owner → the whole network, or one kitchen with «/stats V2».\nconst readErr = $input.all().find((i) => i.json && i.json.error);\nif (readErr) throw new Error('Журнал: ' + readErr.json.error);\n\nconst msg = $('Telegram Trigger').first().json.message || {};\nconst cook = $('Кухар').first().json.cook || {};\nconst text = String(msg.text || '');\nconst rows = $input.all().map((i) => i.json);\nconst p = RL.periodFrom(text);\nconst wantVenue = RL.venueFrom(text);\nconst hint = '«/stats all» — за весь час · «/stats 7» — за тиждень';\nlet reply;\nif (cook.role === 'owner') {\n  if (wantVenue) {\n    const vr = RL.filterRows(rows, { venue: wantVenue, from: p.from });\n    const name = (rows.find((r) => String(r.venue_id).trim().toUpperCase() === wantVenue) || {}).venue || '';\n    reply = RL.venueReport(vr, (wantVenue + ' ' + name).trim(), p.label) + '\\n\\n' + hint;\n  } else {\n    reply = RL.networkReport(RL.filterRows(rows, { from: p.from }), p.label) + '\\n\\n«/stats V2» — одна точка · ' + hint;\n  }\n} else {\n  const vr = RL.filterRows(rows, { venue: cook.venue_id, from: p.from });\n  reply = RL.venueReport(vr, ((cook.venue_id || '') + ' ' + (cook.venue || '')).trim(), p.label)\n    + (wantVenue && wantVenue !== cook.venue_id ? '\\n\\nℹ️ Статистика інших точок доступна лише власнику мережі.' : '')\n    + '\\n\\n' + hint;\n}\nreturn [{ json: { chat_id: String((msg.chat && msg.chat.id) ?? ''), reply: reply.slice(0, 3900) } }];\n"
+      }
+    },
+    {
+      "id": "sheet_log_report",
+      "name": "Журнал — для /report",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -600,
+        -180
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "authentication": "serviceAccount",
+        "resource": "sheet",
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_YOUR_SPREADSHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Журнал"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_GOOGLE_SERVICE_ACCOUNT_CREDENTIAL_ID",
+          "name": "Google Sheets (service account)"
+        }
+      }
+    },
+    {
+      "id": "report_now",
+      "name": "Звіт на вимогу",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -380,
+        -180
+      ],
+      "onError": "continueErrorOutput",
+      "notes": "Why Code: owner-only /report: builds today's network report with the same report-lib as the daily schedule.",
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ===== report-lib — shared by «Зведення», «Звіт на вимогу» and «Щоденний звіт» (tools/build-workflow.js inlines it) =====\nconst RL = (() => {\n  const INCLUDE_DEMO = true; // the demo history counts in reports; set to false for a real kitchen\n  const num = (v) => { if (v === '' || v == null) return null; const n = Number(String(v).replace(',', '.')); return Number.isFinite(n) ? n : null; };\n  const isDemo = (r) => r.demo === true || String(r.demo).trim().toUpperCase() === 'TRUE';\n  const kyivDate = (d) => new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Kyiv' }).format(d);\n  const today = () => kyivDate(new Date());\n  const daysAgo = (n) => kyivDate(new Date(Date.now() - n * 86400000));\n  // v3 rows still say BRAK — split by the sign of the deviation\n  const verdictOf = (r) => { const v = String(r.verdict || ''); if (v !== 'BRAK') return v; const d = num(r.deviation_pct); return d != null && d < 0 ? 'UNDER' : 'OVER'; };\n\n  function filterRows(rows, { venue = null, from = null, includeDemo = INCLUDE_DEMO } = {}) {\n    return rows.filter((r) => r && r.verdict\n      && (!venue || String(r.venue_id).trim().toUpperCase() === venue)\n      && (!from || String(r.date || '').slice(0, 10) >= from)\n      && (includeDemo || !isDemo(r)));\n  }\n  function summarize(rows) {\n    const s = { total: rows.length, OK: 0, UNDER: 0, OVER: 0, MISMATCH: 0, RECHECK: 0, LOWCONF: 0, UNREADABLE: 0 };\n    const under = [], over = [];\n    for (const r of rows) {\n      const v = verdictOf(r); if (v in s) s[v]++;\n      const d = num(r.deviation_pct);\n      if (v === 'UNDER' && d != null) under.push(d);\n      if (v === 'OVER' && d != null) over.push(d);\n    }\n    const avg = (a) => (a.length ? Math.round(a.reduce((x, y) => x + y, 0) / a.length * 10) / 10 : null);\n    s.okPct = s.total ? Math.round(s.OK / s.total * 1000) / 10 : null;\n    s.avgUnder = avg(under); s.avgOver = avg(over);\n    return s;\n  }\n  function top(rows, keyFn, n = 3) {\n    const m = new Map();\n    for (const r of rows) {\n      const v = verdictOf(r); if (!['UNDER', 'OVER', 'MISMATCH'].includes(v)) continue;\n      const k = keyFn(r); if (!k) continue;\n      const e = m.get(k) || { k, n: 0, UNDER: 0, OVER: 0, MISMATCH: 0 }; e.n++; e[v]++; m.set(k, e);\n    }\n    return [...m.values()].sort((a, b) => b.n - a.n).slice(0, n);\n  }\n  const pct = (v) => (v == null ? '—' : v + '%');\n  const sgn = (v) => (v == null ? '' : (v > 0 ? '+' : '') + v + '%');\n  const kinds = (e) => [e.UNDER ? '⬇️' + e.UNDER : '', e.OVER ? '⬆️' + e.OVER : '', e.MISMATCH ? '🚫' + e.MISMATCH : ''].filter(Boolean).join(' ');\n  const line = (s) => `✅ ${pct(s.okPct)} · ⬇️ ${s.UNDER}${s.UNDER ? ' (' + sgn(s.avgUnder) + ')' : ''} · ⬆️ ${s.OVER}${s.OVER ? ' (' + sgn(s.avgOver) + ')' : ''} · 🚫 ${s.MISMATCH} · 🔎 ${s.RECHECK}`;\n  const dishKey = (r) => [r.dish_id, r.dish_name].filter(Boolean).join(' ');\n\n  function venueReport(rows, title, period) {\n    const s = summarize(rows);\n    const L = [`📊 ${title} — ${period}`, '', `Перевірок: ${s.total}`,\n      `✅ У нормі: ${s.OK} (${pct(s.okPct)})`,\n      `⬇️ Недовага: ${s.UNDER}${s.UNDER ? ' · середня ' + sgn(s.avgUnder) : ''}`,\n      `⬆️ Перевага: ${s.OVER}${s.OVER ? ' · середня ' + sgn(s.avgOver) : ''}`,\n      `🚫 Фото ≠ підпис: ${s.MISMATCH}`, `🔎 Перевірити: ${s.RECHECK}`, `⚠️ Не визначено / ❓ нечитабельно: ${s.LOWCONF + s.UNREADABLE}`];\n    const td = top(rows, dishKey);\n    if (td.length) { L.push('', 'Страви з відхиленнями:'); for (const e of td) L.push(`• ${e.k}: ${e.n} (${kinds(e)})`); }\n    const tc = top(rows, (r) => r.chef);\n    if (tc.length) { L.push('', 'Кухарі з відхиленнями:'); for (const e of tc) L.push(`• ${e.k}: ${e.n} (${kinds(e)})`); }\n    if (!s.total) L.push('', 'Перевірок за цей період немає.');\n    return L.join('\\n');\n  }\n  function networkReport(rows, period) {\n    const names = new Map();\n    for (const r of rows) if (r.venue_id) names.set(String(r.venue_id).trim().toUpperCase(), String(r.venue || r.venue_id));\n    const per = [...names.entries()].sort((a, b) => a[0].localeCompare(b[0]))\n      .map(([id, name]) => ({ id, name, s: summarize(rows.filter((r) => String(r.venue_id).trim().toUpperCase() === id)) }));\n    const L = [`🏢 Мережа — ${period}`, ''];\n    for (const v of per) L.push(`${v.id} ${v.name}: ${v.s.total} перевірок`, '   ' + line(v.s));\n    const all = summarize(rows);\n    L.push('', `Разом: ${all.total} · ${line(all)}`);\n    const withData = per.filter((v) => v.s.total >= 5);\n    if (withData.length > 1) {\n      const by = (f) => withData.slice().sort((a, b) => f(b) - f(a))[0];\n      const worst = by((v) => -(v.s.okPct ?? 0));\n      const under = by((v) => v.s.UNDER / v.s.total);\n      const over = by((v) => v.s.OVER / v.s.total);\n      L.push('', `Найнижчий % у нормі: ${worst.id} ${worst.name} (${pct(worst.s.okPct)})`);\n      if (under.s.UNDER) L.push(`Найбільше недоваги: ${under.id} ${under.name} (${under.s.UNDER} з ${under.s.total}, середня ${sgn(under.s.avgUnder)})`);\n      if (over.s.OVER) L.push(`Найбільше переваги: ${over.id} ${over.name} (${over.s.OVER} з ${over.s.total}, середня ${sgn(over.s.avgOver)})`);\n    }\n    const td = top(rows, dishKey);\n    if (td.length) { L.push('', 'Страви з відхиленнями по мережі:'); for (const e of td) L.push(`• ${e.k}: ${e.n} (${kinds(e)})`); }\n    if (!all.total) L.push('Перевірок за цей період немає.');\n    return L.join('\\n');\n  }\n  function periodFrom(text) {\n    const t = String(text || '').toLowerCase();\n    if (/(all|все|всі|весь)/.test(t)) return { from: null, label: 'за весь час' };\n    if (/(^|\\s)7(\\s|$)|тиж|нед|week/.test(t)) return { from: daysAgo(6), label: 'за 7 днів' };\n    return { from: today(), label: 'за сьогодні (' + today() + ')' };\n  }\n  function venueFrom(text) {\n    const m = String(text || '').match(/(?:^|\\s)[vв]\\s?(\\d{1,2})(?!\\d)/i);\n    return m ? 'V' + Number(m[1]) : null;\n  }\n  return { INCLUDE_DEMO, filterRows, summarize, venueReport, networkReport, periodFrom, venueFrom, today, verdictOf };\n})();\n// ===== end report-lib =====\n\n// Code node «Звіт на вимогу» — /report (owner only): today's daily report right now, to the owner who asked.\n// Input: rows of the «Журнал» sheet. report-lib (RL) is inlined above by the build.\nconst msg = $('Telegram Trigger').first().json.message || {};\nconst chatId = String((msg.chat && msg.chat.id) ?? '');\nconst cook = $('Кухар').first().json.cook || {};\nif (cook.role !== 'owner') return [{ json: { chat_id: chatId, reply: 'ℹ️ Команда /report доступна лише власнику мережі.' } }];\nconst readErr = $input.all().find((i) => i.json && i.json.error);\nif (readErr) throw new Error('Журнал: ' + readErr.json.error);\nconst rows = $input.all().map((i) => i.json);\nconst t = RL.today();\nconst reply = '🗓 Щоденний звіт\\n\\n' + RL.networkReport(RL.filterRows(rows, { from: t }), 'за сьогодні (' + t + ')');\nreturn [{ json: { chat_id: chatId, reply: reply.slice(0, 3900) } }];\n"
+      }
+    },
+    {
+      "id": "reset_cache",
+      "name": "Скинути кеш",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -380,
+        -20
+      ],
+      "onError": "continueErrorOutput",
+      "notes": "Why Code: owner-only /reload: clears the cached recipe cards and cook list in workflow static data.",
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Code node «Скинути кеш» — /reload (owner only): forget the cached recipe cards and cook list,\n// so edits in the sheet apply at once instead of within 5–10 minutes.\nconst msg = $('Telegram Trigger').first().json.message || {};\nconst chatId = String((msg.chat && msg.chat.id) ?? '');\nconst cook = $('Кухар').first().json.cook || {};\nif (cook.role !== 'owner') return [{ json: { chat_id: chatId, reply: 'ℹ️ Команда /reload доступна лише власнику мережі.' } }];\nconst sd = $getWorkflowStaticData('global');\ndelete sd.cards; delete sd.cooks;\nreturn [{ json: { chat_id: chatId, reply: '🔄 Кеш скинуто: наступне повідомлення прочитає техкарти й список кухарів із таблиці заново.' } }];\n"
+      }
+    },
+    {
+      "id": "reply_stats",
+      "name": "Відповідь статистики",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -140,
+        -180
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ String(($json.reply) ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram bot"
+        }
+      }
+    },
+    {
+      "id": "sheet_venues",
+      "name": "Точки — читання",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -600,
+        -620
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "authentication": "serviceAccount",
+        "resource": "sheet",
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_YOUR_SPREADSHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Точки"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_GOOGLE_SERVICE_ACCOUNT_CREDENTIAL_ID",
+          "name": "Google Sheets (service account)"
+        }
+      }
+    },
+    {
+      "id": "point",
+      "name": "Точка",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -380,
+        -620
+      ],
+      "onError": "continueErrorOutput",
+      "notes": "Why Code: decides between the kitchen menu, a switch and a refusal from the sender's role, allowed_venues and the active kitchens; clears the cook cache on a switch (workflow static data).",
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Code node «Точка» — «📍 Точка», «/point» or «/point V2»: show the kitchen buttons or switch the sender's kitchen.\n// Input: rows of the «Точки» sheet. Output: { action: menu | set | deny, chat_id, reply, venue_id?, venue? }.\n// The owner may switch to any active kitchen; others only to the kitchens in their allowed_venues column.\nconst readErr = $input.all().find((i) => i.json && i.json.error);\nif (readErr) throw new Error('Точки: ' + readErr.json.error);\nconst msg = $('Telegram Trigger').first().json.message || {};\nconst cook = $('Кухар').first().json.cook || {};\n// the sender's Telegram user ID — the key of their row in «Кухарі»\nconst chatId = cook.chat_id || String((msg.from && msg.from.id) ?? (msg.chat && msg.chat.id) ?? '');\nconst isActive = (v) => v === true || ['TRUE', '1', 'ТАК', 'YES'].includes(String(v ?? '').trim().toUpperCase());\nconst venues = $input.all().map((i) => i.json)\n  .filter((v) => v && v.venue_id && isActive(v.active))\n  .map((v) => ({ id: String(v.venue_id).trim().toUpperCase(), name: String(v.name || v.venue_id) }));\nconst allowedIds = cook.role === 'owner' ? venues.map((v) => v.id) : (cook.allowed || []);\nconst current = venues.find((v) => v.id === cook.venue_id);\nconst now = '📍 Зараз ваші перевірки йдуть у ' + (current ? current.id + ' · ' + current.name : (cook.venue_id || '—')) + '.';\n\nconst m = String(msg.text || '').match(/(?:^|\\s|📍)\\s*[vв]\\s?(\\d{1,2})(?!\\d)/i);\nconst want = m ? 'V' + Number(m[1]) : null;\nif (!want) {\n  if (allowedIds.length < 2) return [{ json: { action: 'deny', chat_id: chatId, reply: now + '\\nВас закріплено за цією точкою. Якщо вас перевели на іншу — попросіть адміністратора змінити її у списку кухарів.' } }];\n  const list = venues.filter((v) => allowedIds.includes(v.id)).map((v) => (v.id === cook.venue_id ? '• ' : '  ') + v.id + ' · ' + v.name);\n  return [{ json: { action: 'menu', chat_id: chatId, reply: now + '\\n\\nОберіть точку кнопкою нижче:\\n' + list.join('\\n') } }];\n}\nconst target = venues.find((v) => v.id === want);\nif (!target) return [{ json: { action: 'deny', chat_id: chatId, reply: 'Точки ' + want + ' немає серед активних у листі «Точки».' } }];\nif (!allowedIds.includes(want)) return [{ json: { action: 'deny', chat_id: chatId, reply: '⛔ Ви не можете надсилати перевірки від імені ' + want + '. ' + now } }];\nif (want === cook.venue_id) return [{ json: { action: 'deny', chat_id: chatId, reply: now + ' Нічого не змінено.' } }];\nconst sd = $getWorkflowStaticData('global');\ndelete sd.cooks; // the cook list changes — re-read it on the next message\nreturn [{ json: { action: 'set', chat_id: chatId, venue_id: target.id, venue: target.name,\n  reply: '✅ Точку змінено: тепер ваші перевірки йдуть у ' + target.id + ' · ' + target.name + '.\\nЩоб повернутися — «📍 Точка».' } }];\n"
+      }
+    },
+    {
+      "id": "point_action",
+      "name": "Дія з точкою",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        -160,
+        -620
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "pa-set",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "set",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "set"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "pa-menu",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "menu",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "menu"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "deny"
+        }
+      }
+    },
+    {
+      "id": "cook_update",
+      "name": "Кухарі — змінити точку",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        60,
+        -760
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "authentication": "serviceAccount",
+        "resource": "sheet",
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_YOUR_SPREADSHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Кухарі"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "chat_id": "={{ $json.chat_id }}",
+            "venue_id": "={{ $json.venue_id }}",
+            "venue": "={{ $json.venue }}"
+          },
+          "matchingColumns": [
+            "chat_id"
+          ],
+          "schema": [
+            {
+              "id": "chat_id",
+              "displayName": "chat_id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "venue_id",
+              "displayName": "venue_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "venue",
+              "displayName": "venue",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {
+          "cellFormat": "RAW"
+        }
+      },
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_GOOGLE_SERVICE_ACCOUNT_CREDENTIAL_ID",
+          "name": "Google Sheets (service account)"
+        }
+      }
+    },
+    {
+      "id": "point_done",
+      "name": "Точку змінено",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        280,
+        -760
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $('Telegram Trigger').first().json.message.chat.id }}",
+        "text": "={{ String(($('Точка').first().json.reply) ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') }}",
+        "replyMarkup": "replyKeyboard",
+        "replyKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "📍 Точка"
+                  },
+                  {
+                    "text": "📊 Статистика"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "replyKeyboardOptions": {
+          "resize_keyboard": true
+        },
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram bot"
+        }
+      }
+    },
+    {
+      "id": "point_menu",
+      "name": "Меню точок",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        60,
+        -620
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $('Telegram Trigger').first().json.message.chat.id }}",
+        "text": "={{ String(($json.reply) ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') }}",
+        "replyMarkup": "replyKeyboard",
+        "replyKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "📍 V1 · Поділ"
+                  },
+                  {
+                    "text": "📍 V2 · Лівобережна"
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "📍 V3 · Печерськ"
+                  },
+                  {
+                    "text": "📍 V4 · Оболонь"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "replyKeyboardOptions": {
+          "resize_keyboard": true
+        },
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram bot"
+        }
+      }
+    },
+    {
+      "id": "point_deny",
+      "name": "Точка — відповідь",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        60,
+        -480
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $('Telegram Trigger').first().json.message.chat.id }}",
+        "text": "={{ String(($json.reply) ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') }}",
+        "replyMarkup": "replyKeyboard",
+        "replyKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "📍 Точка"
+                  },
+                  {
+                    "text": "📊 Статистика"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "replyKeyboardOptions": {
+          "resize_keyboard": true
+        },
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram bot"
+        }
+      }
+    },
+    {
+      "id": "help",
+      "name": "Допомога",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -600,
+        640
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $('Telegram Trigger').first().json.message.chat.id }}",
+        "text": "=👋 Бот контролю ваги страв за техкартою.\n\n1. Обнуліть ваги з порожнім контейнером чи тарілкою (кнопка TARE / ТАРА).\n2. Покладіть порцію і сфотографуйте так, щоб цифри на дисплеї було чітко видно — без бліку й розмиття.\n3. У підписі до фото вкажіть назву або код страви — напр. «Філадельфія з вугрем» або «R02». Кілька порцій на вагах — допишіть «х2».\n4. Бот відповість: ✅ у нормі, ⬇️ недовага, ⬆️ перевага, 🚫 фото не схоже на підпис, 🔎 перевірте фото, ⚠️ не вдалося визначити.\n\nКнопки під полем вводу:\n📊 Статистика — ваша точка за сьогодні (/stats 7 — за тиждень · /stats all — за весь час)\n📍 Точка — показати, куди йдуть ваші перевірки\n\n{{ String(($('Кухар').first().json.cook?.role === 'owner' ? \"Для власника мережі:\\n/stats — усі точки поруч · /stats V2 — одна точка\\n/report — щоденний звіт зараз\\n/reload — перечитати техкарти й список кухарів\\n«📍 Точка» або код точки в підписі («R02 V3») — записати перевірку в іншу точку.\" : $('Кухар').first().json.cook?.can_switch ? \"Ви працюєте в кількох точках: перемкніть «📍 Точка» або допишіть код точки в підпис («R02 V3») — тоді ця перевірка піде у вказану точку.\" : \"Ваша точка — \" + $('Кухар').first().json.cook?.venue_id + ' · ' + $('Кухар').first().json.cook?.venue + \" (за вашим Telegram ID). Усі ваші перевірки йдуть у неї; якщо в підписі код іншої точки — перевірку не буде записано.\") ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') }}",
+        "replyMarkup": "replyKeyboard",
+        "replyKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "📍 Точка"
+                  },
+                  {
+                    "text": "📊 Статистика"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "replyKeyboardOptions": {
+          "resize_keyboard": true
+        },
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram bot"
+        }
+      }
+    },
+    {
       "id": "typing",
       "name": "Друкує…",
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.2,
       "position": [
-        -360,
+        -600,
         120
       ],
       "onError": "continueRegularOutput",
@@ -275,13 +951,62 @@
       }
     },
     {
+      "id": "cards_cache",
+      "name": "Кеш техкарт?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -600,
+        300
+      ],
+      "notes": "Why Code: state across runs: recipe cards are cached in workflow static data for 10 minutes to stay within the Google Sheets read quota.",
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const sd = $getWorkflowStaticData('global');\nreturn [{ json: { fresh: !!(sd.cards && Date.now() - sd.cards.at < 10 * 60 * 1000) } }];"
+      }
+    },
+    {
+      "id": "cards_fresh",
+      "name": "Техкарти з кешу?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -380,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "tf",
+              "leftValue": "={{ $json.fresh }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
       "id": "sheet_cards",
       "name": "Техкарти — читання",
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4.7,
       "position": [
-        -360,
-        300
+        -160,
+        440
       ],
       "alwaysOutputData": true,
       "onError": "continueRegularOutput",
@@ -314,23 +1039,23 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        -140,
+        60,
         300
       ],
       "onError": "continueErrorOutput",
-      "notes": "Why Code: fuzzy matching of a free-text caption (UA/RU, aliases, R-codes, «х2») against the recipe cards, the re-sent-photo check (workflow static data) and the dynamic Vision prompt — no native node covers this.",
+      "notes": "Why Code: fuzzy matching of a free-text caption (UA/RU, aliases, R-codes, «х2») against the recipe cards, the card cache and re-sent-photo check (workflow static data) and the dynamic Vision prompt — no native node covers this.",
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "// Code node «Підпис → кандидат» — runs once for all items (input: rows of the «Техкарти» sheet).\n// Matches the cook's caption to a recipe card, parses portions («х2»), checks for a re-sent photo\n// and builds the Vision prompt. Output: one item with the photo binary passed through.\n\nconst readErr = $input.all().find(i => i.json && i.json.error);\nif (readErr) throw new Error('Техкарти: ' + readErr.json.error);\n\nconst trig = $('Telegram Trigger').first();\nconst msg = trig.json.message || {};\nconst rawCaption = String(msg.caption || '').trim();\n\nconst isActive = v => v === true || ['TRUE', '1', 'ТАК', 'YES'].includes(String(v ?? '').trim().toUpperCase());\nconst num = v => Number(String(v ?? '').replace(',', '.'));\nconst cards = $input.all().map(i => i.json)\n  .filter(c => c && c.dish_id && c.dish_name && isActive(c.active))\n  .map(c => ({\n    dish_id: String(c.dish_id).trim().toUpperCase(),\n    dish_name: String(c.dish_name).trim(),\n    aliases: String(c.aliases || ''),\n    category: String(c.category || ''),\n    norm_grams: num(c.norm_grams),\n    tolerance_pct: num(c.tolerance_pct),\n    pack_grams: Number.isFinite(num(c.pack_grams)) ? num(c.pack_grams) : 0,\n    must_have: String(c.must_have || c.visual_features || ''),\n    may_vary: String(c.may_vary || ''),\n  }))\n  .filter(c => Number.isFinite(c.norm_grams) && c.norm_grams > 0);\nif (!cards.length) throw new Error('Техкарти: немає жодної активної позиції');\n\n// Portions: «х2», «x2», «2х», «2 порції» → the norm is multiplied.\nconst PORTIONS_RE = /(?:^|\\s)(?:[xх×*]\\s?(\\d{1,2})|(\\d{1,2})\\s?[xх×])(?=\\s|$)|(\\d{1,2})\\s*(?:порц\\S*|porc\\S*)/i;\nconst pm = rawCaption.match(PORTIONS_RE);\nconst pn = pm ? Number(pm[1] || pm[2] || pm[3]) : 1;\nconst portions = pn >= 1 && pn <= 10 ? pn : 1;\nconst caption = pm ? rawCaption.replace(PORTIONS_RE, ' ').trim() : rawCaption;\n\n// Ukrainian and Russian spellings fold to one form: «Філадельфія» = «Филадельфия», «Зелений» = «Зеленый».\nconst norm = s => String(s || '').toLowerCase()\n  .replace(/[іїийы]/g, 'и').replace(/[єэё]/g, 'е').replace(/ґ/g, 'г').replace(/[ьъ'’`]/g, '')\n  .replace(/[^a-zа-я0-9]+/g, ' ').replace(/\\s+/g, ' ').trim();\nconst toks = s => norm(s).split(' ').filter(w => w.length >= 3 && !/\\d/.test(w));\nconst names = c => [c.dish_name].concat(c.aliases.split(';')).map(norm).filter(Boolean);\nconst sameWord = (w, x) => x === w || x.startsWith(w) || w.startsWith(x) || (w.length >= 4 && x.includes(w));\n\nlet card = null, captionCandidates = [], normFromCaption = null, idGiven = false;\nif (caption) {\n  const capN = norm(caption);\n  const idm = caption.match(/(?:^|[^a-zа-яіїєґ])[rр]\\s?-?(\\d{1,3})(?!\\d)/i);\n  if (idm) { idGiven = true; const id = 'R' + String(Number(idm[1])).padStart(2, '0'); card = cards.find(c => c.dish_id === id) || null; }\n  if (!card) card = cards.find(c => names(c).includes(capN)) || null;\n  if (!card) {\n    const capW = toks(caption);\n    if (capW.length) {\n      const need = Math.max(1, Math.ceil(capW.length * 0.5));\n      let bestS = 0, best = [];\n      for (const c of cards) {\n        const nt = names(c).flatMap(n => n.split(' ')).filter(w => w.length >= 3);\n        let s = 0; for (const w of capW) if (nt.some(x => sameWord(w, x))) s++;\n        if (s > bestS) { bestS = s; best = [c]; } else if (s === bestS && s > 0) best.push(c);\n      }\n      if (bestS >= need) { if (best.length === 1) card = best[0]; else captionCandidates = best.map(c => c.dish_id); }\n    }\n  }\n  if (!card && !captionCandidates.length && !idGiven) {\n    const gm = caption.match(/(\\d{2,4})(?:[.,]\\d+)?\\s*(?:г|гр|g)?(?![\\d])/i);\n    if (gm) { const n = Number(gm[1]); if (n >= 20 && n <= 5000) normFromCaption = n; }\n  }\n}\n\n// Same photo sent again? (uids are recorded by «Вердикт» after a completed check)\nconst photos = msg.photo || [];\nconst photoUid = String((photos.length ? photos[photos.length - 1].file_unique_id : (msg.document && msg.document.file_unique_id)) || '');\nconst seen = ($getWorkflowStaticData('global').seen || {});\nconst duplicateOf = photoUid && seen[photoUid] ? seen[photoUid] : '';\n\nconst base = 'Ти допомагаєш кухні ресторану контролювати вагу порцій: на фото — страва, яку кухар зважив на кухонних вагах. '\n  + '1) Дисплей ваг: перепиши показання у display_text (з крапкою чи комою, напр. 384.8 або 0.410) і поверни число в display_value. '\n  + 'unit — g або kg (позначка kg або число на кшталт 0.410 — це kg). '\n  + 'digits_confidence від 0 до 1 — наскільки чітко видно кожну цифру. Якщо фото розмите, стиснуте, під кутом або цифри частково закриті бліком — низька впевненість; не вгадуй цифри. '\n  + 'Якщо ваг або дисплея на фото немає — це нормально: readable=false, display_value=null, решту полів заповни. '\n  + '2) Коротко опиши страву українською (looks_like): тип (рол / макі / нігірі / гункан / сет / поке), що зверху, колір, сира риба чи запечена / у клярі. '\n  + '3) in_container — true, якщо страва лежить у контейнері, коробці чи мисці.';\nconst check = card\n  ? ' 4) Кухар підписав фото як «' + card.dish_name + '». Ключові ознаки цієї страви: ' + card.must_have + '. '\n    + 'Допустимі відмінності (НЕ причина невідповідності): ' + (card.may_vary || '—') + '; також будь-який додатковий гарнір, соус, зелень, посипка чи упаковка. '\n    + 'visual_match=false, якщо частину страви, де має бути ключова ознака, ВИДНО, але там інше (інша риба чи топінг, інше покриття, запечене замість сирого, інший тип страви). '\n    + 'visual_match=null лише якщо цю частину страви НЕ видно на фото (закрито, поза кадром, надто темно). '\n    + 'visual_confidence від 0 до 1 — наскільки ти впевнений у visual_match.'\n  : ' 4) Підпису зі стравою немає: visual_match=null.';\nconst fmt = ' Відповідай ЛИШЕ валідним JSON одним рядком без markdown: {\"display_text\": \"<як на дисплеї>\", \"display_value\": <число або null>, \"unit\": \"g|kg\", \"digits_confidence\": <0..1>, \"readable\": <true|false>, \"in_container\": <true|false>, \"looks_like\": \"<короткий опис>\", \"visual_match\": <true|false|null>, \"visual_confidence\": <0..1>, \"visual_reason\": \"<коротко чому, або порожньо>\"}.';\n// Shorter wording for the second attempt, so a refusal of the first prompt is not simply repeated.\nconst retryPrompt = 'Фото з кухні ресторану: порція страви на кухонних вагах (ваг може й не бути в кадрі). '\n  + 'Відповідай ЛИШЕ JSON одним рядком: {\"display_text\": \"<цифри на дисплеї або порожньо>\", \"display_value\": <число або null>, \"unit\": \"g|kg\", \"digits_confidence\": <0..1>, \"readable\": <true якщо цифри видно>, \"in_container\": <true|false>, \"looks_like\": \"<що за страва, українською>\", '\n  + (card ? '\"visual_match\": <true якщо схоже на «' + card.dish_name + '» (' + card.must_have + '), false якщо видно, що ні, null якщо не видно>, \"visual_confidence\": <0..1>, \"visual_reason\": \"<коротко>\"}.'\n    : '\"visual_match\": null, \"visual_confidence\": 0, \"visual_reason\": \"\"}.');\n\nreturn [{\n  json: {\n    caption: rawCaption, card, portions,\n    match_source: card ? 'caption' : (normFromCaption ? 'norm' : ''),\n    caption_candidates: captionCandidates, norm_from_caption: normFromCaption,\n    photo_uid: photoUid, duplicate_of: duplicateOf,\n    cards, vision_prompt: base + check + fmt, vision_prompt_retry: retryPrompt,\n  },\n  binary: trig.binary,\n}];\n"
+        "jsCode": "// Code node «Підпис → кандидат» — runs once for all items. Input: rows of the «Техкарти» sheet, or one\n// {fresh: true} item when the cached cards (workflow static data, refreshed every 10 minutes or by /reload) are valid.\n// Picks the kitchen (profile or a code in the caption, with the lock check), matches the cook's caption to a recipe\n// card, parses portions («х2»), checks for a re-sent photo and builds the Vision prompt.\n// Output: one item with the photo binary passed through; a non-empty stop_reply means «answer this, log nothing».\n\nconst sd = $getWorkflowStaticData('global');\nconst inRows = $input.all().map(i => i.json);\nconst readErr = inRows.find(r => r && r.error);\nif (readErr) throw new Error('Техкарти: ' + readErr.error);\nlet sheetRows;\nif (inRows.some(r => r && r.dish_id)) { sheetRows = inRows; sd.cards = { at: Date.now(), rows: inRows }; }\nelse if (sd.cards && sd.cards.rows) sheetRows = sd.cards.rows;\nelse throw new Error('Техкарти: немає даних');\n\nconst trig = $('Telegram Trigger').first();\nconst msg = trig.json.message || {};\nconst rawCaption = String(msg.caption || '').trim();\nlet cook = null;\ntry { cook = $('Кухар').first().json.cook || null; } catch (e) { /* only in offline tests */ }\n\n// Which kitchen gets this check. By default — the kitchen in the sender's profile (Telegram ID → «Кухарі»).\n// A kitchen code in the caption («R02 V3») sends this one check elsewhere, but only for the owner and for people\n// who have that kitchen in allowed_venues. A cook locked to one kitchen who writes another kitchen's code gets a\n// warning and nothing is logged — so the wrong kitchen's statistics are not spoiled and no duplicate appears later.\nconst VENUE_RE = /(?:^|[\\s,;:(])📍?\\s*[VvВв](\\d{1,2})(?![\\d\\p{L}])/u;\nconst vm = rawCaption.match(VENUE_RE);\nconst wantVenue = vm ? 'V' + Number(vm[1]) : null;\nlet venueId = cook ? cook.venue_id : '', venueName = cook ? cook.venue : '', stopReply = '';\nif (cook) {\n  const known = cook.venues && cook.venues.length ? cook.venues : null;\n  const own = cook.venue_id + (cook.venue ? ' · ' + cook.venue : '');\n  const target = known && wantVenue ? known.find((v) => v.id === wantVenue) : null;\n  if (cook.venue_ok === false) {\n    stopReply = '⛔ Ваш профіль не прив\\'язано до активної точки (у листі «Кухарі»: «' + (cook.venue_id || '—') + '»).\\nПеревірку не записано — зверніться до адміністратора.';\n  } else if (wantVenue && wantVenue !== cook.venue_id) {\n    if (known && !target) stopReply = '⛔ Точки ' + wantVenue + ' немає серед активних.\\nПеревірку не записано. Надішліть фото без коду точки — воно піде у вашу точку (' + own + ').';\n    else if (cook.role === 'owner' || (cook.allowed || []).includes(wantVenue)) { venueId = wantVenue; venueName = target ? target.name : wantVenue; }\n    else stopReply = '⛔ Ви закріплені за точкою ' + own + ', а в підписі вказано ' + wantVenue + (target ? ' · ' + target.name : '') + '.\\n'\n      + 'Перевірку не записано, щоб не зіпсувати статистику точок. Надішліть фото ще раз без коду точки — воно піде у вашу точку.';\n  }\n}\n\nconst isActive = v => v === true || ['TRUE', '1', 'ТАК', 'YES'].includes(String(v ?? '').trim().toUpperCase());\nconst num = v => (v === '' || v == null) ? NaN : Number(String(v).replace(',', '.'));\nconst cards = sheetRows\n  .filter(c => c && c.dish_id && c.dish_name && isActive(c.active))\n  .map(c => ({\n    dish_id: String(c.dish_id).trim().toUpperCase(),\n    dish_name: String(c.dish_name).trim(),\n    aliases: String(c.aliases || ''),\n    category: String(c.category || ''),\n    norm_grams: num(c.norm_grams),\n    tol_under: num(c.tol_under_pct ?? c.tolerance_pct),\n    tol_over: num(c.tol_over_pct ?? c.tolerance_pct),\n    pack_grams: Number.isFinite(num(c.pack_grams)) ? num(c.pack_grams) : 0,\n    must_have: String(c.must_have || c.visual_features || ''),\n    may_vary: String(c.may_vary || ''),\n  }))\n  .filter(c => Number.isFinite(c.norm_grams) && c.norm_grams > 0);\nif (!cards.length) throw new Error('Техкарти: немає жодної активної позиції');\n\n// Portions: «х2», «x2», «2х», «2 порції» → the norm is multiplied.\nconst PORTIONS_RE = /(?:^|\\s)(?:[xх×*]\\s?(\\d{1,2})|(\\d{1,2})\\s?[xх×])(?=\\s|$)|(\\d{1,2})\\s*(?:порц\\S*|porc\\S*)/i;\nconst noVenue = vm ? rawCaption.replace(VENUE_RE, ' ').trim() : rawCaption;\nconst pm = noVenue.match(PORTIONS_RE);\nconst pn = pm ? Number(pm[1] || pm[2] || pm[3]) : 1;\nconst portions = pn >= 1 && pn <= 10 ? pn : 1;\nconst caption = pm ? noVenue.replace(PORTIONS_RE, ' ').trim() : noVenue;\n\n// Ukrainian and Russian spellings fold to one form: «Філадельфія» = «Филадельфия», «Зелений» = «Зеленый».\nconst norm = s => String(s || '').toLowerCase()\n  .replace(/[іїийы]/g, 'и').replace(/[єэё]/g, 'е').replace(/ґ/g, 'г').replace(/[ьъ'’`]/g, '')\n  .replace(/[^a-zа-я0-9]+/g, ' ').replace(/\\s+/g, ' ').trim();\nconst toks = s => norm(s).split(' ').filter(w => w.length >= 3 && !/\\d/.test(w));\nconst names = c => [c.dish_name].concat(c.aliases.split(';')).map(norm).filter(Boolean);\nconst sameWord = (w, x) => x === w || x.startsWith(w) || w.startsWith(x) || (w.length >= 4 && x.includes(w));\n\nlet card = null, captionCandidates = [], normFromCaption = null, idGiven = false;\nif (caption) {\n  const capN = norm(caption);\n  const idm = caption.match(/(?:^|[^a-zа-яіїєґ])[rр]\\s?-?(\\d{1,3})(?!\\d)/i);\n  if (idm) { idGiven = true; const id = 'R' + String(Number(idm[1])).padStart(2, '0'); card = cards.find(c => c.dish_id === id) || null; }\n  if (!card) card = cards.find(c => names(c).includes(capN)) || null;\n  if (!card) {\n    const capW = toks(caption);\n    if (capW.length) {\n      const need = Math.max(1, Math.ceil(capW.length * 0.5));\n      let bestS = 0, best = [];\n      for (const c of cards) {\n        const nt = names(c).flatMap(n => n.split(' ')).filter(w => w.length >= 3);\n        let s = 0; for (const w of capW) if (nt.some(x => sameWord(w, x))) s++;\n        if (s > bestS) { bestS = s; best = [c]; } else if (s === bestS && s > 0) best.push(c);\n      }\n      if (bestS >= need) { if (best.length === 1) card = best[0]; else captionCandidates = best.map(c => c.dish_id); }\n    }\n  }\n  if (!card && !captionCandidates.length && !idGiven) {\n    const gm = caption.match(/(\\d{2,4})(?:[.,]\\d+)?\\s*(?:г|гр|g)?(?![\\d])/i);\n    if (gm) { const n = Number(gm[1]); if (n >= 20 && n <= 5000) normFromCaption = n; }\n  }\n}\n\n// Same photo FILE sent again? Telegram gives every new camera shot its own file_unique_id, so identical-looking\n// portions never collide — only a re-sent file does. A re-sent file with a different caption (or after an\n// unfinished check) is a correction and is checked again; the same file with the same caption after a final\n// verdict is stopped. Entries are recorded by «Вердикт».\nconst photos = msg.photo || [];\nconst photoUid = String((photos.length ? photos[photos.length - 1].file_unique_id : (msg.document && msg.document.file_unique_id)) || '');\nconst seenRaw = photoUid ? (sd.seen || {})[photoUid] : null;\n// older records are a bare timestamp without caption or verdict — treat them as unfinished, so they can be re-checked\nconst seen = seenRaw ? (typeof seenRaw === 'string' ? { ts: seenRaw, caption: null, final: false } : seenRaw) : null;\nconst sameCaption = seen && (seen.caption === null || norm(seen.caption) === norm(rawCaption));\nconst duplicateOf = !stopReply && seen && seen.final && sameCaption ? seen.ts : '';\nconst recheckOf = seen && !duplicateOf ? seen.ts : '';\nif (duplicateOf) stopReply = '♻️ Це саме фото з тим самим підписом уже перевіряли (' + duplicateOf + ').\\n'\n  + 'Нова порція — сфотографуйте її ще раз. Помилилися з підписом — надішліть це фото з правильним підписом, і бот перевірить його знову.';\n\nconst base = 'Ти допомагаєш кухні ресторану контролювати вагу порцій: на фото — страва, яку кухар зважив на кухонних вагах. '\n  + '1) Дисплей ваг: перепиши показання у display_text (з крапкою чи комою, напр. 384.8 або 0.410) і поверни число в display_value. '\n  + 'unit — g або kg (позначка kg або число на кшталт 0.410 — це kg). '\n  + 'digits_confidence від 0 до 1 — наскільки чітко видно кожну цифру. Якщо фото розмите, стиснуте, під кутом або цифри частково закриті бліком — низька впевненість; не вгадуй цифри. '\n  + 'Якщо ваг або дисплея на фото немає — це нормально: readable=false, display_value=null, решту полів заповни. '\n  + '2) Коротко опиши страву українською (looks_like): тип (рол / макі / нігірі / гункан / сет / поке), що зверху, колір, сира риба чи запечена / у клярі. '\n  + '3) in_container — true, якщо страва лежить у контейнері, коробці чи мисці.';\nconst check = card\n  ? ' 4) Кухар підписав фото як «' + card.dish_name + '». Ключові ознаки цієї страви: ' + card.must_have + '. '\n    + 'Допустимі відмінності (НЕ причина невідповідності): ' + (card.may_vary || '—') + '; також будь-який додатковий гарнір, соус, зелень, посипка чи упаковка. '\n    + 'visual_match=false, якщо частину страви, де має бути ключова ознака, ВИДНО, але там інше (інша риба чи топінг, інше покриття, запечене замість сирого, інший тип страви). '\n    + 'visual_match=null лише якщо цю частину страви НЕ видно на фото (закрито, поза кадром, надто темно). '\n    + 'visual_confidence від 0 до 1 — наскільки ти впевнений у visual_match.'\n  : ' 4) Підпису зі стравою немає: visual_match=null.';\nconst fmt = ' Відповідай ЛИШЕ валідним JSON одним рядком без markdown: {\"display_text\": \"<як на дисплеї>\", \"display_value\": <число або null>, \"unit\": \"g|kg\", \"digits_confidence\": <0..1>, \"readable\": <true|false>, \"in_container\": <true|false>, \"looks_like\": \"<короткий опис>\", \"visual_match\": <true|false|null>, \"visual_confidence\": <0..1>, \"visual_reason\": \"<коротко чому, або порожньо>\"}.';\n// Shorter wording for the second attempt, so a refusal of the first prompt is not simply repeated.\nconst retryPrompt = 'Фото з кухні ресторану: порція страви на кухонних вагах (ваг може й не бути в кадрі). '\n  + 'Відповідай ЛИШЕ JSON одним рядком: {\"display_text\": \"<цифри на дисплеї або порожньо>\", \"display_value\": <число або null>, \"unit\": \"g|kg\", \"digits_confidence\": <0..1>, \"readable\": <true якщо цифри видно>, \"in_container\": <true|false>, \"looks_like\": \"<що за страва, українською>\", '\n  + (card ? '\"visual_match\": <true якщо схоже на «' + card.dish_name + '» (' + card.must_have + '), false якщо видно, що ні, null якщо не видно>, \"visual_confidence\": <0..1>, \"visual_reason\": \"<коротко>\"}.'\n    : '\"visual_match\": null, \"visual_confidence\": 0, \"visual_reason\": \"\"}.');\n\nreturn [{\n  json: {\n    caption: rawCaption, card, portions,\n    match_source: card ? 'caption' : (normFromCaption ? 'norm' : ''),\n    caption_candidates: captionCandidates, norm_from_caption: normFromCaption,\n    photo_uid: photoUid, duplicate_of: duplicateOf, recheck_of: recheckOf,\n    venue_id: venueId, venue: venueName, stop_reply: stopReply,\n    cards, vision_prompt: base + check + fmt, vision_prompt_retry: retryPrompt,\n  },\n  binary: trig.binary,\n}];\n"
       }
     },
     {
-      "id": "dup",
-      "name": "Повтор фото?",
+      "id": "stop",
+      "name": "Не записувати?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
-        80,
+        280,
         300
       ],
       "parameters": {
@@ -343,8 +1068,8 @@
           },
           "conditions": [
             {
-              "id": "dp",
-              "leftValue": "={{ $json.duplicate_of }}",
+              "id": "st",
+              "leftValue": "={{ $json.stop_reply }}",
               "rightValue": "",
               "operator": {
                 "type": "string",
@@ -359,21 +1084,22 @@
       }
     },
     {
-      "id": "dup_reply",
-      "name": "Відповідь: повтор",
+      "id": "stop_reply",
+      "name": "Відповідь: не записано",
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.2,
       "position": [
-        300,
+        500,
         120
       ],
       "parameters": {
         "resource": "message",
         "operation": "sendMessage",
         "chatId": "={{ $('Telegram Trigger').first().json.message.chat.id }}",
-        "text": "=♻️ Це фото вже перевіряли ({{ $json.duplicate_of }}).\nЗважте порцію і сфотографуйте її ще раз.",
+        "text": "={{ String(($json.stop_reply) ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') }}",
         "additionalFields": {
-          "appendAttribution": false
+          "appendAttribution": false,
+          "parse_mode": "HTML"
         }
       },
       "credentials": {
@@ -389,7 +1115,7 @@
       "type": "@n8n/n8n-nodes-langchain.openAi",
       "typeVersion": 1.8,
       "position": [
-        300,
+        500,
         320
       ],
       "onError": "continueErrorOutput",
@@ -423,7 +1149,7 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
-        520,
+        720,
         320
       ],
       "parameters": {
@@ -456,7 +1182,7 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        740,
+        940,
         480
       ],
       "onError": "continueErrorOutput",
@@ -472,7 +1198,7 @@
       "type": "@n8n/n8n-nodes-langchain.openAi",
       "typeVersion": 1.8,
       "position": [
-        960,
+        1160,
         480
       ],
       "onError": "continueErrorOutput",
@@ -506,14 +1232,14 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1180,
+        1380,
         300
       ],
       "onError": "continueErrorOutput",
-      "notes": "Why Code: one node turns the Vision reading into the verdict: units, the decimal-point fix, container, portions, tolerance, plausibility, visual confidence and the weight-based candidate search — a native chain would need a dozen IF / Set / Filter / Sort nodes.",
+      "notes": "Why Code: one node turns the Vision reading into the verdict: units, the decimal-point fix, container, portions, separate under/over tolerances, plausibility, visual confidence and the weight-based candidate search — a native chain would need a dozen IF / Set / Filter / Sort nodes.",
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "// Code node «Вердикт» — runs once for all items (input: the OpenAI Vision answer).\n// Turns the Vision reading into a verdict and the reply text. Output: one journal row (+ reply, chat_id).\n//   OK · BRAK · MISMATCH (photo ≠ caption) · RECHECK (digits unclear / implausible deviation) · LOWCONF · UNREADABLE\n\nconst N = '\\n';\nconst DEFAULT_TOL = 2.9;   // % — used when a card has no tolerance and for «Тех карта N» captions\nconst PLAUSIBLE = 30;      // % — a bigger deviation is more likely a misread, a container or several portions\nconst MIN_DIGITS = 0.6;    // below this digits_confidence the weight is not trusted\nconst MIN_VISUAL = 0.7;    // MISMATCH only when Vision is at least this sure\n\nconst pre = $('Підпис → кандидат').first().json;\nconst msg = $('Telegram Trigger').first().json.message || {};\nconst cards = pre.cards || [];\nconst portions = pre.portions || 1;\n\n// ---- Vision answer ----\nconst v = $input.first().json || {};\nconst vt = typeof v === 'string' ? v : (v.content ?? v.text ?? v.output ?? (v.message && v.message.content) ?? JSON.stringify(v));\nlet vp = {}; try { const m = String(vt).match(/\\{[\\s\\S]*\\}/); if (m) vp = JSON.parse(m[0]); } catch (e) {}\nconst visionEmpty = !('display_value' in vp) && !('scale_grams' in vp) && !('readable' in vp);\nconst toNum = x => Number(String(x ?? '').replace(',', '.'));\nlet value = toNum(vp.display_value ?? vp.scale_grams);\nif (vp.display_value == null && vp.scale_grams == null || !Number.isFinite(value) || value <= 0) value = null;\nconst unit = String(vp.unit || '').toLowerCase();\nconst digitsConf = Number.isFinite(toNum(vp.digits_confidence)) && vp.digits_confidence !== null && vp.digits_confidence !== '' ? toNum(vp.digits_confidence) : 0.8;\nconst inContainer = vp.in_container === true;\nconst looks = String(vp.looks_like || '').slice(0, 200);\nconst vmatch = vp.visual_match === true ? true : (vp.visual_match === false ? false : null);\nconst vconf = Number.isFinite(toNum(vp.visual_confidence)) && vp.visual_confidence !== null ? toNum(vp.visual_confidence) : 0.5;\nconst vreason = String(vp.visual_reason || '').slice(0, 200);\n\n// ---- weight helpers ----\nconst round1 = x => Math.round(x * 10) / 10;\nconst grams = value == null ? null : ((unit === 'kg' || unit === 'кг' || value < 10) ? round1(value * 1000) : value);\nconst fixDecimal = (s, n) => (s != null && n && s >= n * 3 && s / 10 >= n * 0.5 && s / 10 <= n * 1.5) ? round1(s / 10) : s;\nconst tolOf = c => (Number.isFinite(c.tolerance_pct) && c.tolerance_pct > 0) ? c.tolerance_pct : DEFAULT_TOL;\n// Compare the reading with a norm; subtract the container only when Vision sees one AND it brings the weight closer.\nconst evaluate = (normTotal, pack, tol) => {\n  const scale = fixDecimal(grams, normTotal);\n  const devNet = (scale - normTotal) / normTotal * 100;\n  let tare = 0, dev = devNet;\n  if (inContainer && pack > 0) {\n    const devTare = (scale - pack - normTotal) / normTotal * 100;\n    if (Math.abs(devTare) < Math.abs(devNet)) { tare = pack; dev = devTare; }\n  }\n  return { scale, tare, net: round1(scale - tare), dev, within: Math.abs(dev) <= tol, tol };\n};\n\n// ---- which dish ----\nconst KINDS = [\n  { re: /поке|боул|миск/, cats: ['поке'] },\n  { re: /нігірі|нигири/, cats: ['нігірі'] },\n  { re: /гункан|човник/, cats: ['гункани'] },\n  { re: /рол|макі|маки|сет/, cats: ['роли', 'запечені роли', 'темпура роли', 'макі', 'футомакі', 'сети'] },\n];\nconst kindHit = KINDS.find(k => k.re.test(looks.toLowerCase()));\nconst kindOk = c => !kindHit || kindHit.cats.includes(c.category);\n\nlet card = pre.card || null, source = pre.match_source || '', candidates = [], ev = null;\nconst readable = grams !== null && vp.readable !== false;\nif (readable && !card && (pre.caption_candidates || []).length) {\n  const tied = cards.filter(c => pre.caption_candidates.includes(c.dish_id));\n  const ok = tied.map(c => ({ c, e: evaluate(c.norm_grams * portions, c.pack_grams, tolOf(c)) })).filter(x => x.e.within);\n  if (ok.length === 1) { card = ok[0].c; source = 'caption'; } else candidates = tied.slice(0, 3);\n} else if (!card && (pre.caption_candidates || []).length) {\n  candidates = cards.filter(c => pre.caption_candidates.includes(c.dish_id)).slice(0, 3);\n}\nif (readable && !card && !pre.norm_from_caption && !candidates.length) {\n  const sc = cards.map(c => ({ c, e: evaluate(c.norm_grams * portions, c.pack_grams, tolOf(c)) }));\n  const within = sc.filter(x => x.e.within && kindOk(x.c));\n  if (within.length === 1) { card = within[0].c; source = 'weight'; }\n  else {\n    const pool = within.length ? within : sc.filter(x => Math.abs(x.e.dev) <= 25);\n    candidates = pool.slice().sort((a, b) => (kindOk(b.c) - kindOk(a.c)) || (Math.abs(a.e.dev) - Math.abs(b.e.dev))).slice(0, 3).map(x => x.c);\n  }\n}\n\n// ---- verdict ----\nlet normTotal = null, verdict, recheckWhy = '';\nconst strongMismatch = !!pre.card && vmatch === false && vconf >= MIN_VISUAL;\nconst doubtMismatch = !!pre.card && vmatch === false && !strongMismatch;\nif (visionEmpty || !readable) verdict = 'UNREADABLE';\nelse if (card || pre.norm_from_caption) {\n  normTotal = (card ? card.norm_grams : pre.norm_from_caption) * portions;\n  ev = evaluate(normTotal, card ? card.pack_grams : 0, card ? tolOf(card) : DEFAULT_TOL);\n  if (!card) source = 'norm';\n  if (strongMismatch) verdict = 'MISMATCH';\n  else if (digitsConf < MIN_DIGITS) { verdict = 'RECHECK'; recheckWhy = 'digits'; }\n  else if (Math.abs(ev.dev) > PLAUSIBLE) { verdict = 'RECHECK'; recheckWhy = 'implausible'; }\n  else verdict = ev.within ? 'OK' : 'BRAK';\n} else verdict = digitsConf < MIN_DIGITS ? 'RECHECK' : 'LOWCONF';\nif (verdict === 'RECHECK' && !recheckWhy) recheckWhy = 'digits';\n\n// ---- reply ----\n// Near the tolerance edge show two decimals, so «+2.94%» is not displayed as «+2.9%» next to a BRAK.\nconst devShown = d => (ev && Math.abs(round1(d)) === ev.tol) ? Math.round(d * 100) / 100 : round1(d);\nconst pct = d => (d > 0 ? '+' : '') + devShown(d) + '%';\nconst title = card ? card.dish_id + ' · ' + card.dish_name + (portions > 1 ? ' × ' + portions : '')\n  : (pre.norm_from_caption ? 'Норма з підпису: ' + pre.norm_from_caption + ' г' + (portions > 1 ? ' × ' + portions : '') : '');\nconst via = { caption: 'за підписом', norm: 'норма з підпису', weight: 'визначено за вагою — якщо страва інша, вкажіть назву або код у підписі' }[source] || '';\nconst weightLines = () => ev ? [\n  'Норма: ' + normTotal + ' г ±' + ev.tol + '%',\n  'На вагах: ' + ev.scale + ' г' + (ev.tare ? ' (мінус контейнер ' + ev.tare + ' г = ' + ev.net + ' г)' : ''),\n  'Відхилення: ' + pct(ev.dev),\n] : [];\nconst candLines = () => candidates.length ? ['Можливо:'].concat(candidates.map(c => '• ' + c.dish_id + ' ' + c.dish_name + ' — ' + c.norm_grams + ' г')) : [];\nconst doubtLine = doubtMismatch ? '⚠️ Можлива невідповідність фото підпису: ' + (vreason || 'перевірте страву') + '.' : '';\nlet lines;\nif (verdict === 'OK') lines = ['✅ У нормі', title].concat(weightLines(), ['(' + via + ')', doubtLine]);\nelse if (verdict === 'BRAK') lines = ['⛔️ БРАК — поза допуском', title].concat(weightLines(), ['(' + via + ')', doubtLine, 'Записано в журнал.']);\nelse if (verdict === 'MISMATCH') lines = ['🚫 Фото не схоже на «' + card.dish_name + '»', 'Причина: ' + (vreason || 'ключові ознаки не збігаються з техкартою')].concat(weightLines(), ['Перевірте страву або підпис. Записано в журнал.']);\nelse if (verdict === 'RECHECK' && recheckWhy === 'implausible') lines = ['⚠️ Перевірте, будь ласка', title, 'На вагах: ' + ev.scale + ' г при нормі ' + normTotal + ' г (' + pct(ev.dev) + ').',\n  'Можливі причини:', '• цифри прочитано неправильно — перезніміть дисплей ближче;', '• на вагах кілька порцій — допишіть «х2»;', '• зважено з посудом — обнуліть ваги з порожнім контейнером (TARE).', doubtLine, 'Записано в журнал як «перевірити».'];\nelse if (verdict === 'RECHECK') lines = ['⚠️ Цифри на вагах видно нечітко' + (grams != null ? ' (прочитано: ' + grams + ' г)' : '') + '.', 'Перезніміть дисплей ближче, без бліку і розмиття. Записано в журнал як «перевірити».'];\nelse if (verdict === 'LOWCONF') lines = ['⚠️ Не вдалося визначити позицію', (pre.caption && !pre.card && !pre.norm_from_caption && !(pre.caption_candidates || []).length) ? 'У техкарті не знайдено «' + pre.caption + '».' : '', 'На вагах: ' + (grams != null ? grams + ' г' : '—')].concat(candLines(), ['Вкажіть у підписі назву або код страви (напр. «R01»). Записано в журнал.']);\nelse if (visionEmpty) lines = ['❓ Сервіс розпізнавання не відповів.', 'Надішліть фото ще раз.'];\nelse lines = ['❓ Не вдалося зчитати цифри на вагах.', 'Сфотографуйте так, щоб дисплей ваг було чітко видно.', pre.card && vmatch === false ? 'Також фото не схоже на «' + pre.card.dish_name + '»: ' + (vreason || 'ознаки не збігаються') + '.' : '', 'Записано в журнал.'];\nconst reply = lines.filter(Boolean).join(N);\n\n// ---- remember the photo (not when Vision returned nothing — the cook should resend the same photo) ----\nconst now = new Date();\nconst ts = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Kyiv', dateStyle: 'short', timeStyle: 'medium' }).format(now);\nif (pre.photo_uid && !visionEmpty) {\n  const sd = $getWorkflowStaticData('global');\n  sd.seen = sd.seen || {};\n  sd.seen[pre.photo_uid] = ts;\n  const keys = Object.keys(sd.seen);\n  if (keys.length > 500) for (const k of keys.slice(0, keys.length - 500)) delete sd.seen[k];\n}\n\nconst from = msg.from || {};\nconst chef = [from.first_name, from.last_name].filter(Boolean).join(' ') + (from.username ? ' (@' + from.username + ')' : '');\nconst visual_check = pre.card ? (vmatch === true ? 'match' : strongMismatch ? 'mismatch' : doubtMismatch ? 'doubt' : 'unsure') : 'n/a';\nreturn [{ json: {\n  ts, date: ts.slice(0, 10), chef, chat_id: String((msg.chat && msg.chat.id) ?? from.id ?? ''),\n  dish_id: card ? card.dish_id : '', dish_name: card ? card.dish_name : (looks || pre.caption || ''),\n  match_source: source, portions,\n  norm_grams: normTotal, scale_grams: ev ? ev.scale : grams, tare_grams: ev ? ev.tare : null, net_grams: ev ? ev.net : null,\n  deviation_pct: ev ? devShown(ev.dev) : null, tolerance_pct: ev ? ev.tol : null,\n  verdict, visual_check,\n  visual_reason: visionEmpty ? (v.content ? 'vision: відповідь без JSON — ' + String(v.content).slice(0, 80) : 'vision: порожня відповідь') : (vreason || looks),\n  digits_confidence: grams != null ? digitsConf : null, photo_uid: pre.photo_uid || '',\n  tg_message_id: String(msg.message_id ?? ''), reply,\n} }];\n"
+        "jsCode": "// Code node «Вердикт» — runs once for all items (input: the OpenAI Vision answer).\n// Turns the Vision reading into a verdict and the reply text. Output: one journal row (+ reply, chat_id).\n//   OK · UNDER (underweight) · OVER (overweight) · MISMATCH (photo ≠ caption) · RECHECK (digits unclear /\n//   implausible deviation) · LOWCONF · UNREADABLE\n\nconst N = '\\n';\nconst DEFAULT_UNDER = 2.9; // % — allowed underweight when a card has none, and for «Тех карта N» captions\nconst DEFAULT_OVER = 5;    // % — allowed overweight (softer: the customer is not short-changed)\nconst PLAUSIBLE = 30;      // % — a bigger deviation is more likely a misread, a container or several portions\nconst MIN_DIGITS = 0.6;    // below this digits_confidence the weight is not trusted\nconst MIN_VISUAL = 0.7;    // MISMATCH only when Vision is at least this sure\n\nconst pre = $('Підпис → кандидат').first().json;\nconst msg = $('Telegram Trigger').first().json.message || {};\nconst cook = $('Кухар').first().json.cook || {};\nconst cards = pre.cards || [];\nconst portions = pre.portions || 1;\n\n// ---- Vision answer ----\nconst v = $input.first().json || {};\nconst vt = typeof v === 'string' ? v : (v.content ?? v.text ?? v.output ?? (v.message && v.message.content) ?? JSON.stringify(v));\nlet vp = {}; try { const m = String(vt).match(/\\{[\\s\\S]*\\}/); if (m) vp = JSON.parse(m[0]); } catch (e) {}\nconst visionEmpty = !('display_value' in vp) && !('scale_grams' in vp) && !('readable' in vp);\nconst toNum = x => Number(String(x ?? '').replace(',', '.'));\nlet value = toNum(vp.display_value ?? vp.scale_grams);\nif (vp.display_value == null && vp.scale_grams == null || !Number.isFinite(value) || value <= 0) value = null;\nconst unit = String(vp.unit || '').toLowerCase();\nconst digitsConf = Number.isFinite(toNum(vp.digits_confidence)) && vp.digits_confidence !== null && vp.digits_confidence !== '' ? toNum(vp.digits_confidence) : 0.8;\nconst inContainer = vp.in_container === true;\nconst looks = String(vp.looks_like || '').slice(0, 200);\nconst vmatch = vp.visual_match === true ? true : (vp.visual_match === false ? false : null);\nconst vconf = Number.isFinite(toNum(vp.visual_confidence)) && vp.visual_confidence !== null ? toNum(vp.visual_confidence) : 0.5;\nconst vreason = String(vp.visual_reason || '').slice(0, 200);\n\n// ---- weight helpers ----\nconst round1 = x => Math.round(x * 10) / 10;\nconst grams = value == null ? null : ((unit === 'kg' || unit === 'кг' || value < 10) ? round1(value * 1000) : value);\nconst fixDecimal = (s, n) => (s != null && n && s >= n * 3 && s / 10 >= n * 0.5 && s / 10 <= n * 1.5) ? round1(s / 10) : s;\nconst pos = (x, d) => (Number.isFinite(x) && x > 0 ? x : d);\nconst tolsOf = c => c ? { u: pos(c.tol_under, DEFAULT_UNDER), o: pos(c.tol_over, DEFAULT_OVER) } : { u: DEFAULT_UNDER, o: DEFAULT_OVER };\n// Compare the reading with a norm; subtract the container only when Vision sees one AND it brings the weight closer.\nconst evaluate = (normTotal, pack, t) => {\n  const scale = fixDecimal(grams, normTotal);\n  const devNet = (scale - normTotal) / normTotal * 100;\n  let tare = 0, dev = devNet;\n  if (inContainer && pack > 0) {\n    const devTare = (scale - pack - normTotal) / normTotal * 100;\n    if (Math.abs(devTare) < Math.abs(devNet)) { tare = pack; dev = devTare; }\n  }\n  return { scale, tare, net: round1(scale - tare), dev, within: dev >= -t.u && dev <= t.o, u: t.u, o: t.o };\n};\n\n// ---- which dish ----\nconst KINDS = [\n  { re: /поке|боул|миск/, cats: ['поке'] },\n  { re: /нігірі|нигири/, cats: ['нігірі'] },\n  { re: /гункан|човник/, cats: ['гункани'] },\n  { re: /рол|макі|маки|сет/, cats: ['роли', 'запечені роли', 'темпура роли', 'макі', 'футомакі', 'сети'] },\n];\nconst kindHit = KINDS.find(k => k.re.test(looks.toLowerCase()));\nconst kindOk = c => !kindHit || kindHit.cats.includes(c.category);\n\nlet card = pre.card || null, source = pre.match_source || '', candidates = [], ev = null;\nconst readable = grams !== null && vp.readable !== false;\nif (readable && !card && (pre.caption_candidates || []).length) {\n  const tied = cards.filter(c => pre.caption_candidates.includes(c.dish_id));\n  const ok = tied.map(c => ({ c, e: evaluate(c.norm_grams * portions, c.pack_grams, tolsOf(c)) })).filter(x => x.e.within);\n  if (ok.length === 1) { card = ok[0].c; source = 'caption'; } else candidates = tied.slice(0, 3);\n} else if (!card && (pre.caption_candidates || []).length) {\n  candidates = cards.filter(c => pre.caption_candidates.includes(c.dish_id)).slice(0, 3);\n}\nif (readable && !card && !pre.norm_from_caption && !candidates.length) {\n  const sc = cards.map(c => ({ c, e: evaluate(c.norm_grams * portions, c.pack_grams, tolsOf(c)) }));\n  const within = sc.filter(x => x.e.within && kindOk(x.c));\n  if (within.length === 1) { card = within[0].c; source = 'weight'; }\n  else {\n    const pool = within.length ? within : sc.filter(x => Math.abs(x.e.dev) <= 25);\n    candidates = pool.slice().sort((a, b) => (kindOk(b.c) - kindOk(a.c)) || (Math.abs(a.e.dev) - Math.abs(b.e.dev))).slice(0, 3).map(x => x.c);\n  }\n}\n\n// ---- verdict ----\nlet normTotal = null, verdict, recheckWhy = '';\nconst strongMismatch = !!pre.card && vmatch === false && vconf >= MIN_VISUAL;\nconst doubtMismatch = !!pre.card && vmatch === false && !strongMismatch;\nif (visionEmpty || !readable) verdict = 'UNREADABLE';\nelse if (card || pre.norm_from_caption) {\n  normTotal = (card ? card.norm_grams : pre.norm_from_caption) * portions;\n  ev = evaluate(normTotal, card ? card.pack_grams : 0, tolsOf(card));\n  if (!card) source = 'norm';\n  if (strongMismatch) verdict = 'MISMATCH';\n  else if (digitsConf < MIN_DIGITS) { verdict = 'RECHECK'; recheckWhy = 'digits'; }\n  else if (Math.abs(ev.dev) > PLAUSIBLE) { verdict = 'RECHECK'; recheckWhy = 'implausible'; }\n  else verdict = ev.within ? 'OK' : (ev.dev < 0 ? 'UNDER' : 'OVER');\n} else verdict = digitsConf < MIN_DIGITS ? 'RECHECK' : 'LOWCONF';\nif (verdict === 'RECHECK' && !recheckWhy) recheckWhy = 'digits';\n\n// ---- reply ----\n// Near a tolerance edge show two decimals, so «−2.94%» is not displayed as «−2.9%» next to a «НЕДОВАГА».\nconst devShown = d => (ev && Math.abs(round1(d)) === (d < 0 ? ev.u : ev.o)) ? Math.round(d * 100) / 100 : round1(d);\nconst pct = d => (d > 0 ? '+' : '') + devShown(d) + '%';\nconst title = card ? card.dish_id + ' · ' + card.dish_name + (portions > 1 ? ' × ' + portions : '')\n  : (pre.norm_from_caption ? 'Норма з підпису: ' + pre.norm_from_caption + ' г' + (portions > 1 ? ' × ' + portions : '') : '');\nconst via = { caption: 'за підписом', norm: 'норма з підпису', weight: 'визначено за вагою — якщо страва інша, вкажіть назву або код у підписі' }[source] || '';\nconst weightLines = () => ev ? [\n  'Норма: ' + normTotal + ' г (допуск −' + ev.u + '% / +' + ev.o + '%)',\n  'На вагах: ' + ev.scale + ' г' + (ev.tare ? ' (мінус контейнер ' + ev.tare + ' г = ' + ev.net + ' г)' : ''),\n  'Відхилення: ' + pct(ev.dev),\n] : [];\nconst candLines = () => candidates.length ? ['Можливо:'].concat(candidates.map(c => '• ' + c.dish_id + ' ' + c.dish_name + ' — ' + c.norm_grams + ' г')) : [];\nconst doubtLine = doubtMismatch ? '⚠️ Можлива невідповідність фото підпису: ' + (vreason || 'перевірте страву') + '.' : '';\nlet lines;\nif (verdict === 'OK') lines = ['✅ У нормі', title].concat(weightLines(), ['(' + via + ')', doubtLine]);\nelse if (verdict === 'UNDER') lines = ['⬇️ НЕДОВАГА — порція менша за норму', title].concat(weightLines(), ['(' + via + ')', doubtLine, 'Записано в журнал.']);\nelse if (verdict === 'OVER') lines = ['⬆️ ПЕРЕВАГА — порція більша за норму', title].concat(weightLines(), ['(' + via + ')', doubtLine, 'Записано в журнал.']);\nelse if (verdict === 'MISMATCH') lines = ['🚫 Фото не схоже на «' + card.dish_name + '»', 'Причина: ' + (vreason || 'ключові ознаки не збігаються з техкартою')].concat(weightLines(), ['Перевірте страву або підпис. Записано в журнал.']);\nelse if (verdict === 'RECHECK' && recheckWhy === 'implausible') lines = ['⚠️ Перевірте, будь ласка', title, 'На вагах: ' + ev.scale + ' г при нормі ' + normTotal + ' г (' + pct(ev.dev) + ').',\n  'Можливі причини:', '• цифри прочитано неправильно — перезніміть дисплей ближче;', '• на вагах кілька порцій — допишіть «х2»;', '• зважено з посудом — обнуліть ваги з порожнім контейнером (TARE).', doubtLine, 'Записано в журнал як «перевірити».'];\nelse if (verdict === 'RECHECK') lines = ['⚠️ Цифри на вагах видно нечітко' + (grams != null ? ' (прочитано: ' + grams + ' г)' : '') + '.', 'Перезніміть дисплей ближче, без бліку і розмиття. Записано в журнал як «перевірити».'];\nelse if (verdict === 'LOWCONF') lines = ['⚠️ Не вдалося визначити позицію', (pre.caption && !pre.card && !pre.norm_from_caption && !(pre.caption_candidates || []).length) ? 'У техкарті не знайдено «' + pre.caption + '».' : '', 'На вагах: ' + (grams != null ? grams + ' г' : '—')].concat(candLines(), ['Вкажіть у підписі назву або код страви (напр. «R01»). Записано в журнал.']);\nelse if (visionEmpty) lines = ['❓ Сервіс розпізнавання не відповів.', 'Надішліть фото ще раз.'];\nelse lines = ['❓ Не вдалося зчитати цифри на вагах.', 'Сфотографуйте так, щоб дисплей ваг було чітко видно.', pre.card && vmatch === false ? 'Також фото не схоже на «' + pre.card.dish_name + '»: ' + (vreason || 'ознаки не збігаються') + '.' : '', 'Записано в журнал.'];\nif (pre.recheck_of) lines.unshift('🔁 Повторна перевірка цього ж фото (попередня — ' + pre.recheck_of + ').');\n// the kitchen this check goes to: the profile's, or the one coded in the caption (checked in «Підпис → кандидат»)\nconst venueId = pre.venue_id || cook.venue_id || '';\nconst venueName = pre.venue || cook.venue || '';\n// people who can switch kitchens (and anyone whose check went to another kitchen) see where it is logged\nif (venueId && (cook.can_switch || venueId !== cook.venue_id)) lines.push('📍 ' + venueId + ' · ' + venueName);\nconst reply = lines.filter(Boolean).join(N);\n\n// ---- remember the photo (not when Vision returned nothing — the cook should resend the same photo) ----\nconst now = new Date();\nconst ts = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Kyiv', dateStyle: 'short', timeStyle: 'medium' }).format(now);\nif (pre.photo_uid && !visionEmpty) {\n  const sd = $getWorkflowStaticData('global');\n  sd.seen = sd.seen || {};\n  sd.seen[pre.photo_uid] = { ts, caption: pre.caption || '', final: ['OK', 'UNDER', 'OVER', 'MISMATCH'].includes(verdict) };\n  const keys = Object.keys(sd.seen);\n  if (keys.length > 500) for (const k of keys.slice(0, keys.length - 500)) delete sd.seen[k];\n}\n\nconst from = msg.from || {};\nconst chef = [from.first_name, from.last_name].filter(Boolean).join(' ') + (from.username ? ' (@' + from.username + ')' : '');\nconst visual_check = pre.card ? (vmatch === true ? 'match' : strongMismatch ? 'mismatch' : doubtMismatch ? 'doubt' : 'unsure') : 'n/a';\nreturn [{ json: {\n  venue_id: venueId, venue: venueName,\n  ts, date: ts.slice(0, 10), chef, chat_id: String(from.id ?? (msg.chat && msg.chat.id) ?? ''),\n  dish_id: card ? card.dish_id : '', dish_name: card ? card.dish_name : (looks || pre.caption || ''),\n  match_source: source, portions,\n  norm_grams: normTotal, scale_grams: ev ? ev.scale : grams, tare_grams: ev ? ev.tare : null, net_grams: ev ? ev.net : null,\n  deviation_pct: ev ? devShown(ev.dev) : null, tol_under_pct: ev ? ev.u : null, tol_over_pct: ev ? ev.o : null,\n  verdict, visual_check,\n  visual_reason: visionEmpty ? (v.content ? 'vision: відповідь без JSON — ' + String(v.content).slice(0, 80) : 'vision: порожня відповідь') : (vreason || looks),\n  digits_confidence: grams != null ? digitsConf : null, photo_uid: pre.photo_uid || '',\n  tg_message_id: String(msg.message_id ?? ''), demo: false, reply,\n} }];\n"
       }
     },
     {
@@ -522,7 +1248,7 @@
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4.7,
       "position": [
-        1400,
+        1600,
         300
       ],
       "onError": "continueErrorOutput",
@@ -545,6 +1271,24 @@
           "value": {},
           "matchingColumns": [],
           "schema": [
+            {
+              "id": "venue_id",
+              "displayName": "venue_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "venue",
+              "displayName": "venue",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
             {
               "id": "ts",
               "displayName": "ts",
@@ -663,8 +1407,17 @@
               "canBeUsedToMatch": true
             },
             {
-              "id": "tolerance_pct",
-              "displayName": "tolerance_pct",
+              "id": "tol_under_pct",
+              "displayName": "tol_under_pct",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tol_over_pct",
+              "displayName": "tol_over_pct",
               "required": false,
               "defaultMatch": false,
               "display": true,
@@ -724,6 +1477,15 @@
               "display": true,
               "type": "string",
               "canBeUsedToMatch": true
+            },
+            {
+              "id": "demo",
+              "displayName": "demo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
             }
           ]
         },
@@ -745,16 +1507,17 @@
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.2,
       "position": [
-        1620,
+        1820,
         220
       ],
       "parameters": {
         "resource": "message",
         "operation": "sendMessage",
-        "chatId": "={{ $('Вердикт').item.json.chat_id }}",
-        "text": "={{ $('Вердикт').item.json.reply }}",
+        "chatId": "={{ $('Telegram Trigger').first().json.message.chat.id }}",
+        "text": "={{ String(($('Вердикт').item.json.reply) ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') }}",
         "additionalFields": {
-          "appendAttribution": false
+          "appendAttribution": false,
+          "parse_mode": "HTML"
         }
       },
       "credentials": {
@@ -770,16 +1533,17 @@
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.2,
       "position": [
-        1620,
+        1820,
         400
       ],
       "parameters": {
         "resource": "message",
         "operation": "sendMessage",
-        "chatId": "={{ $('Вердикт').item.json.chat_id }}",
-        "text": "={{ $('Вердикт').item.json.reply }}\n\n⚠️ Запис у журнал не вдався — повідомте адміністратора.",
+        "chatId": "={{ $('Telegram Trigger').first().json.message.chat.id }}",
+        "text": "={{ String(($('Вердикт').item.json.reply) ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') }}\n\n⚠️ Запис у журнал не вдався — повідомте адміністратора.",
         "additionalFields": {
-          "appendAttribution": false
+          "appendAttribution": false,
+          "parse_mode": "HTML"
         }
       },
       "credentials": {
@@ -790,16 +1554,64 @@
       }
     },
     {
-      "id": "sheet_log_read",
-      "name": "Журнал — читання",
+      "id": "tech_error",
+      "name": "Технічна помилка",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1380,
+        680
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $('Telegram Trigger').first().json.message.chat.id }}",
+        "text": "⚠️ Технічна помилка — перевірку не виконано. Спробуйте ще раз за хвилину; якщо повторюється, повідомте адміністратора.",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram bot"
+        }
+      }
+    },
+    {
+      "id": "daily_trigger",
+      "name": "Щодня о 22:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -2160,
+        980
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 22,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "sheet_log_daily",
+      "name": "Журнал — для звіту",
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4.7,
       "position": [
-        -360,
-        -120
+        -1940,
+        980
       ],
       "alwaysOutputData": true,
-      "onError": "continueRegularOutput",
+      "onError": "stopWorkflow",
       "parameters": {
         "authentication": "serviceAccount",
         "resource": "sheet",
@@ -824,87 +1636,73 @@
       }
     },
     {
-      "id": "stats",
-      "name": "Зведення",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
+      "id": "sheet_cooks_daily",
+      "name": "Кухарі — для звіту",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
       "position": [
-        -140,
-        -120
+        -1720,
+        980
       ],
-      "onError": "continueErrorOutput",
-      "notes": "Why Code: Summarize could count verdicts, but the reply also needs a today/all scope switch, per-verdict lines for problem checks and one formatted Telegram text — one short node instead of Filter + Summarize + Sort + Limit + Aggregate + Set.",
+      "alwaysOutputData": true,
+      "onError": "stopWorkflow",
+      "executeOnce": true,
       "parameters": {
-        "mode": "runOnceForAllItems",
-        "jsCode": "// Code node «Зведення» — runs once for all items (input: rows of the «Журнал» sheet). Builds the /stats reply.\nconst readErr = $input.all().find(i => i.json && i.json.error);\nif (readErr) throw new Error('Журнал: ' + readErr.json.error);\n\nconst N = '\\n';\nconst msg = $('Telegram Trigger').first().json.message || {};\nconst rows = $input.all().map(i => i.json).filter(r => r && r.verdict);\nconst scopeAll = /(all|все|всі|усі|весь)/i.test(String(msg.text || ''));\nconst today = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Kyiv' }).format(new Date());\nconst inScope = scopeAll ? rows : rows.filter(r => String(r.date || '').slice(0, 10) === today);\nconst cnt = v => inScope.filter(r => r.verdict === v).length;\nconst devs = inScope.filter(r => r.verdict === 'OK' || r.verdict === 'BRAK')\n  .map(r => Math.abs(Number(String(r.deviation_pct).replace(',', '.')))).filter(Number.isFinite);\nconst avg = devs.length ? Math.round(devs.reduce((a, b) => a + b, 0) / devs.length * 10) / 10 : null;\nconst icon = { BRAK: '⛔️', MISMATCH: '🚫', RECHECK: '🔎', LOWCONF: '⚠️', UNREADABLE: '❓' };\nconst has = x => x !== '' && x != null;\nconst failed = inScope.filter(r => r.verdict !== 'OK');\nconst lines = failed.slice(-20).reverse().map(r => {\n  const g = has(r.net_grams) ? r.net_grams : (has(r.scale_grams) ? r.scale_grams : r.actual_grams);\n  return (icon[r.verdict] || '•') + ' ' + String(r.ts || '').slice(5, 16) + ' '\n    + ([r.dish_id, r.dish_name].filter(Boolean).join(' ') || '—')\n    + (has(g) ? ': ' + g + ' г' : '')\n    + (has(r.deviation_pct) ? ' (' + (Number(r.deviation_pct) > 0 ? '+' : '') + r.deviation_pct + '%)' : '')\n    + (r.chef ? ' — ' + r.chef : '');\n});\nlet parts = ['📊 Статистика ' + (scopeAll ? 'за весь час' : 'за сьогодні (' + today + ')'), '',\n  'Всього перевірок: ' + inScope.length,\n  '✅ У нормі: ' + cnt('OK'),\n  '⛔️ Брак: ' + cnt('BRAK'),\n  '🚫 Фото ≠ підпис: ' + cnt('MISMATCH'),\n  '🔎 Перевірити: ' + cnt('RECHECK'),\n  '⚠️ Невизначено: ' + cnt('LOWCONF'),\n  '❓ Нечитабельно: ' + cnt('UNREADABLE')];\nif (avg != null) parts.push('Середнє відхилення: ' + avg + '%');\nif (failed.length) { parts.push('', 'Останні проблемні (' + Math.min(20, failed.length) + ' з ' + failed.length + '):'); parts = parts.concat(lines); }\nelse parts.push('', 'Проблемних перевірок немає 👌');\nif (!scopeAll) parts.push('', '«/stats all» — за весь час.');\nreturn [{ json: { chat_id: String((msg.chat && msg.chat.id) ?? ''), reply: parts.join(N).slice(0, 3800) } }];\n"
+        "authentication": "serviceAccount",
+        "resource": "sheet",
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_YOUR_SPREADSHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Кухарі"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_GOOGLE_SERVICE_ACCOUNT_CREDENTIAL_ID",
+          "name": "Google Sheets (service account)"
+        }
       }
     },
     {
-      "id": "reply_stats",
-      "name": "Відповідь статистики",
+      "id": "daily",
+      "name": "Щоденний звіт",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1500,
+        980
+      ],
+      "notes": "Why Code: one message per recipient: the network report for owners and the own-kitchen report for managers, built by the shared report-lib.",
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ===== report-lib — shared by «Зведення», «Звіт на вимогу» and «Щоденний звіт» (tools/build-workflow.js inlines it) =====\nconst RL = (() => {\n  const INCLUDE_DEMO = true; // the demo history counts in reports; set to false for a real kitchen\n  const num = (v) => { if (v === '' || v == null) return null; const n = Number(String(v).replace(',', '.')); return Number.isFinite(n) ? n : null; };\n  const isDemo = (r) => r.demo === true || String(r.demo).trim().toUpperCase() === 'TRUE';\n  const kyivDate = (d) => new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Kyiv' }).format(d);\n  const today = () => kyivDate(new Date());\n  const daysAgo = (n) => kyivDate(new Date(Date.now() - n * 86400000));\n  // v3 rows still say BRAK — split by the sign of the deviation\n  const verdictOf = (r) => { const v = String(r.verdict || ''); if (v !== 'BRAK') return v; const d = num(r.deviation_pct); return d != null && d < 0 ? 'UNDER' : 'OVER'; };\n\n  function filterRows(rows, { venue = null, from = null, includeDemo = INCLUDE_DEMO } = {}) {\n    return rows.filter((r) => r && r.verdict\n      && (!venue || String(r.venue_id).trim().toUpperCase() === venue)\n      && (!from || String(r.date || '').slice(0, 10) >= from)\n      && (includeDemo || !isDemo(r)));\n  }\n  function summarize(rows) {\n    const s = { total: rows.length, OK: 0, UNDER: 0, OVER: 0, MISMATCH: 0, RECHECK: 0, LOWCONF: 0, UNREADABLE: 0 };\n    const under = [], over = [];\n    for (const r of rows) {\n      const v = verdictOf(r); if (v in s) s[v]++;\n      const d = num(r.deviation_pct);\n      if (v === 'UNDER' && d != null) under.push(d);\n      if (v === 'OVER' && d != null) over.push(d);\n    }\n    const avg = (a) => (a.length ? Math.round(a.reduce((x, y) => x + y, 0) / a.length * 10) / 10 : null);\n    s.okPct = s.total ? Math.round(s.OK / s.total * 1000) / 10 : null;\n    s.avgUnder = avg(under); s.avgOver = avg(over);\n    return s;\n  }\n  function top(rows, keyFn, n = 3) {\n    const m = new Map();\n    for (const r of rows) {\n      const v = verdictOf(r); if (!['UNDER', 'OVER', 'MISMATCH'].includes(v)) continue;\n      const k = keyFn(r); if (!k) continue;\n      const e = m.get(k) || { k, n: 0, UNDER: 0, OVER: 0, MISMATCH: 0 }; e.n++; e[v]++; m.set(k, e);\n    }\n    return [...m.values()].sort((a, b) => b.n - a.n).slice(0, n);\n  }\n  const pct = (v) => (v == null ? '—' : v + '%');\n  const sgn = (v) => (v == null ? '' : (v > 0 ? '+' : '') + v + '%');\n  const kinds = (e) => [e.UNDER ? '⬇️' + e.UNDER : '', e.OVER ? '⬆️' + e.OVER : '', e.MISMATCH ? '🚫' + e.MISMATCH : ''].filter(Boolean).join(' ');\n  const line = (s) => `✅ ${pct(s.okPct)} · ⬇️ ${s.UNDER}${s.UNDER ? ' (' + sgn(s.avgUnder) + ')' : ''} · ⬆️ ${s.OVER}${s.OVER ? ' (' + sgn(s.avgOver) + ')' : ''} · 🚫 ${s.MISMATCH} · 🔎 ${s.RECHECK}`;\n  const dishKey = (r) => [r.dish_id, r.dish_name].filter(Boolean).join(' ');\n\n  function venueReport(rows, title, period) {\n    const s = summarize(rows);\n    const L = [`📊 ${title} — ${period}`, '', `Перевірок: ${s.total}`,\n      `✅ У нормі: ${s.OK} (${pct(s.okPct)})`,\n      `⬇️ Недовага: ${s.UNDER}${s.UNDER ? ' · середня ' + sgn(s.avgUnder) : ''}`,\n      `⬆️ Перевага: ${s.OVER}${s.OVER ? ' · середня ' + sgn(s.avgOver) : ''}`,\n      `🚫 Фото ≠ підпис: ${s.MISMATCH}`, `🔎 Перевірити: ${s.RECHECK}`, `⚠️ Не визначено / ❓ нечитабельно: ${s.LOWCONF + s.UNREADABLE}`];\n    const td = top(rows, dishKey);\n    if (td.length) { L.push('', 'Страви з відхиленнями:'); for (const e of td) L.push(`• ${e.k}: ${e.n} (${kinds(e)})`); }\n    const tc = top(rows, (r) => r.chef);\n    if (tc.length) { L.push('', 'Кухарі з відхиленнями:'); for (const e of tc) L.push(`• ${e.k}: ${e.n} (${kinds(e)})`); }\n    if (!s.total) L.push('', 'Перевірок за цей період немає.');\n    return L.join('\\n');\n  }\n  function networkReport(rows, period) {\n    const names = new Map();\n    for (const r of rows) if (r.venue_id) names.set(String(r.venue_id).trim().toUpperCase(), String(r.venue || r.venue_id));\n    const per = [...names.entries()].sort((a, b) => a[0].localeCompare(b[0]))\n      .map(([id, name]) => ({ id, name, s: summarize(rows.filter((r) => String(r.venue_id).trim().toUpperCase() === id)) }));\n    const L = [`🏢 Мережа — ${period}`, ''];\n    for (const v of per) L.push(`${v.id} ${v.name}: ${v.s.total} перевірок`, '   ' + line(v.s));\n    const all = summarize(rows);\n    L.push('', `Разом: ${all.total} · ${line(all)}`);\n    const withData = per.filter((v) => v.s.total >= 5);\n    if (withData.length > 1) {\n      const by = (f) => withData.slice().sort((a, b) => f(b) - f(a))[0];\n      const worst = by((v) => -(v.s.okPct ?? 0));\n      const under = by((v) => v.s.UNDER / v.s.total);\n      const over = by((v) => v.s.OVER / v.s.total);\n      L.push('', `Найнижчий % у нормі: ${worst.id} ${worst.name} (${pct(worst.s.okPct)})`);\n      if (under.s.UNDER) L.push(`Найбільше недоваги: ${under.id} ${under.name} (${under.s.UNDER} з ${under.s.total}, середня ${sgn(under.s.avgUnder)})`);\n      if (over.s.OVER) L.push(`Найбільше переваги: ${over.id} ${over.name} (${over.s.OVER} з ${over.s.total}, середня ${sgn(over.s.avgOver)})`);\n    }\n    const td = top(rows, dishKey);\n    if (td.length) { L.push('', 'Страви з відхиленнями по мережі:'); for (const e of td) L.push(`• ${e.k}: ${e.n} (${kinds(e)})`); }\n    if (!all.total) L.push('Перевірок за цей період немає.');\n    return L.join('\\n');\n  }\n  function periodFrom(text) {\n    const t = String(text || '').toLowerCase();\n    if (/(all|все|всі|весь)/.test(t)) return { from: null, label: 'за весь час' };\n    if (/(^|\\s)7(\\s|$)|тиж|нед|week/.test(t)) return { from: daysAgo(6), label: 'за 7 днів' };\n    return { from: today(), label: 'за сьогодні (' + today() + ')' };\n  }\n  function venueFrom(text) {\n    const m = String(text || '').match(/(?:^|\\s)[vв]\\s?(\\d{1,2})(?!\\d)/i);\n    return m ? 'V' + Number(m[1]) : null;\n  }\n  return { INCLUDE_DEMO, filterRows, summarize, venueReport, networkReport, periodFrom, venueFrom, today, verdictOf };\n})();\n// ===== end report-lib =====\n\n// Code node «Щоденний звіт» — runs on the schedule (22:00 Kyiv). Input: rows of the «Кухарі» sheet;\n// the journal comes from «Журнал — для звіту». Output: one message per recipient —\n// owners get the network report, managers get their own kitchen. report-lib (RL) is inlined above by the build.\nconst journal = $('Журнал — для звіту').all().map((i) => i.json);\nif (journal.some((r) => r && r.error)) throw new Error('Журнал недоступний');\nconst people = $input.all().map((i) => i.json).filter((r) => r && r.chat_id);\nconst isActive = (v) => v === true || ['TRUE', '1', 'ТАК', 'YES'].includes(String(v ?? '').trim().toUpperCase());\nconst t = RL.today();\nconst day = RL.filterRows(journal, { from: t });\nconst out = [];\nfor (const p of people) {\n  if (!isActive(p.active)) continue;\n  const role = String(p.role || '').trim().toLowerCase();\n  const venueId = String(p.venue_id || '').trim().toUpperCase();\n  if (role === 'owner') out.push({ json: { chat_id: String(p.chat_id), reply: ('🗓 Щоденний звіт\\n\\n' + RL.networkReport(day, 'за сьогодні (' + t + ')')).slice(0, 3900) } });\n  else if (role === 'manager' && venueId) {\n    const vr = RL.filterRows(journal, { venue: venueId, from: t });\n    out.push({ json: { chat_id: String(p.chat_id), reply: ('🗓 Щоденний звіт\\n\\n' + RL.venueReport(vr, (venueId + ' ' + (p.venue || '')).trim(), 'за сьогодні (' + t + ')')).slice(0, 3900) } });\n  }\n}\nreturn out;\n"
+      }
+    },
+    {
+      "id": "daily_send",
+      "name": "Щоденний звіт — надіслати",
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.2,
       "position": [
-        80,
-        -120
+        -1280,
+        980
       ],
+      "onError": "continueRegularOutput",
       "parameters": {
         "resource": "message",
         "operation": "sendMessage",
         "chatId": "={{ $json.chat_id }}",
-        "text": "={{ $json.reply }}",
+        "text": "={{ String(($json.reply) ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') }}",
         "additionalFields": {
-          "appendAttribution": false
-        }
-      },
-      "credentials": {
-        "telegramApi": {
-          "id": "REPLACE_TELEGRAM_CREDENTIAL_ID",
-          "name": "Telegram bot"
-        }
-      }
-    },
-    {
-      "id": "help",
-      "name": "Допомога",
-      "type": "n8n-nodes-base.telegram",
-      "typeVersion": 1.2,
-      "position": [
-        -360,
-        560
-      ],
-      "parameters": {
-        "resource": "message",
-        "operation": "sendMessage",
-        "chatId": "={{ $('Telegram Trigger').first().json.message.chat.id }}",
-        "text": "👋 Бот контролю ваги страв за техкартою.\n\n1. Обнуліть ваги з порожнім контейнером чи тарілкою (кнопка TARE / ТАРА).\n2. Покладіть порцію і сфотографуйте так, щоб цифри на дисплеї було чітко видно — без бліку й розмиття.\n3. У підписі до фото вкажіть назву або код страви — напр. «Філадельфія з вугрем» або «R02». Кілька порцій на вагах — допишіть «х2».\n4. Бот відповість: ✅ у нормі, ⛔️ брак, 🚫 фото не схоже на підпис, 🔎 перевірте фото, ⚠️ не вдалося визначити.\n\nКоманди:\n/stats — статистика за сьогодні\n/stats all — за весь час",
-        "additionalFields": {
-          "appendAttribution": false
-        }
-      },
-      "credentials": {
-        "telegramApi": {
-          "id": "REPLACE_TELEGRAM_CREDENTIAL_ID",
-          "name": "Telegram bot"
-        }
-      }
-    },
-    {
-      "id": "tech_error",
-      "name": "Технічна помилка",
-      "type": "n8n-nodes-base.telegram",
-      "typeVersion": 1.2,
-      "position": [
-        1180,
-        620
-      ],
-      "parameters": {
-        "resource": "message",
-        "operation": "sendMessage",
-        "chatId": "={{ $('Telegram Trigger').first().json.message.chat.id }}",
-        "text": "⚠️ Технічна помилка — перевірку не виконано. Спробуйте ще раз за хвилину; якщо повторюється, повідомте адміністратора.",
-        "additionalFields": {
-          "appendAttribution": false
+          "appendAttribution": false,
+          "parse_mode": "HTML"
         }
       },
       "credentials": {
@@ -920,18 +1718,58 @@
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
       "position": [
-        -1740,
-        -340
+        -2200,
+        -420
       ],
       "parameters": {
-        "width": 820,
-        "height": 330,
-        "content": "## 🍣 Sushi QC Bot — контроль ваги за техкартою\n\n**Флоу:** доступ за списком «Кухарі» → фото страви на вагах (+ назва / код / «х2» у підписі) → Vision читає вагу, одиниці й упевненість у цифрах, звіряє ключові ознаки з техкартою → вердикт → рядок у «Журнал» → відповідь кухарю.\n\n**Вердикти:** OK · BRAK · MISMATCH (фото ≠ підпис) · RECHECK (цифри нечіткі або відхилення неправдоподібне) · LOWCONF · UNREADABLE.\n\n**Google Sheets:** `Техкарти` (норма, допуск %, вага упаковки, ключові й допустимі ознаки), `Журнал`, `Кухарі` (chat_id, active).\n**Код нод** зберігається в `src/*.js` репозиторію; цей JSON збирається `tools/build-workflow.js`."
+        "width": 900,
+        "height": 380,
+        "content": "## 🍣 Sushi QC Bot — мережа кухонь, одна техкарта\n\n**Фото:** хто пише (Telegram ID → лист «Кухарі» → точка і роль; точка має бути активною в «Точках») → код точки в підписі дозволено лише власнику та allowed_venues, закріпленому кухарю — «не записано» → фото страви на вагах (+ назва / код / «х2») → Vision читає вагу, одиниці, контейнер, звіряє ключові ознаки з техкартою → вердикт → рядок у спільний «Журнал» з точкою → відповідь кухарю.\n\n**Вердикти:** OK · UNDER (недовага, допуск tol_under_pct) · OVER (перевага, tol_over_pct) · MISMATCH · RECHECK · LOWCONF · UNREADABLE.\n\n**Звіти:** /stats (своя точка; власник — уся мережа або /stats V2), /report (власник, щоденний звіт зараз), щодня о 22:00 — власникам і менеджерам точок.\n**Google Sheets:** «Техкарти», «Журнал», «Кухарі», «Точки», сторінки точок і «Мережа» (формули).\n**Код нод** — у `src/*.js` репозиторію; цей JSON збирає `tools/build-workflow.js`."
       }
     }
   ],
   "connections": {
     "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Кеш кухарів?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Кеш кухарів?": {
+      "main": [
+        [
+          {
+            "node": "Кухарі з кешу?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Кухарі з кешу?": {
+      "main": [
+        [
+          {
+            "node": "Кухар",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Точки — для кешу",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Точки — для кешу": {
       "main": [
         [
           {
@@ -946,36 +1784,32 @@
       "main": [
         [
           {
-            "node": "Активні кухарі",
+            "node": "Кухар",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Активні кухарі": {
+    "Кухар": {
       "main": [
         [
           {
-            "node": "Список ID",
+            "node": "Є в списку?",
             "type": "main",
             "index": 0
           }
-        ]
-      ]
-    },
-    "Список ID": {
-      "main": [
+        ],
         [
           {
-            "node": "Доступ?",
+            "node": "Технічна помилка",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Доступ?": {
+    "Є в списку?": {
       "main": [
         [
           {
@@ -1004,12 +1838,33 @@
         ],
         [
           {
+            "node": "Журнал — для /report",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Скинути кеш",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Точки — читання",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
             "node": "Друкує…",
             "type": "main",
             "index": 0
           },
           {
-            "node": "Техкарти — читання",
+            "node": "Кеш техкарт?",
             "type": "main",
             "index": 0
           }
@@ -1017,6 +1872,183 @@
         [
           {
             "node": "Допомога",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Точки — читання": {
+      "main": [
+        [
+          {
+            "node": "Точка",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Точка": {
+      "main": [
+        [
+          {
+            "node": "Дія з точкою",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Технічна помилка",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Дія з точкою": {
+      "main": [
+        [
+          {
+            "node": "Кухарі — змінити точку",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Меню точок",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Точка — відповідь",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Кухарі — змінити точку": {
+      "main": [
+        [
+          {
+            "node": "Точку змінено",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Технічна помилка",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Журнал — читання": {
+      "main": [
+        [
+          {
+            "node": "Зведення",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Зведення": {
+      "main": [
+        [
+          {
+            "node": "Відповідь статистики",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Технічна помилка",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Журнал — для /report": {
+      "main": [
+        [
+          {
+            "node": "Звіт на вимогу",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Звіт на вимогу": {
+      "main": [
+        [
+          {
+            "node": "Відповідь статистики",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Технічна помилка",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Скинути кеш": {
+      "main": [
+        [
+          {
+            "node": "Відповідь статистики",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Технічна помилка",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Кеш техкарт?": {
+      "main": [
+        [
+          {
+            "node": "Техкарти з кешу?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Техкарти з кешу?": {
+      "main": [
+        [
+          {
+            "node": "Підпис → кандидат",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Техкарти — читання",
             "type": "main",
             "index": 0
           }
@@ -1038,7 +2070,7 @@
       "main": [
         [
           {
-            "node": "Повтор фото?",
+            "node": "Не записувати?",
             "type": "main",
             "index": 0
           }
@@ -1052,11 +2084,11 @@
         ]
       ]
     },
-    "Повтор фото?": {
+    "Не записувати?": {
       "main": [
         [
           {
-            "node": "Відповідь: повтор",
+            "node": "Відповідь: не записано",
             "type": "main",
             "index": 0
           }
@@ -1178,29 +2210,44 @@
         ]
       ]
     },
-    "Журнал — читання": {
+    "Щодня о 22:00": {
       "main": [
         [
           {
-            "node": "Зведення",
+            "node": "Журнал — для звіту",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Зведення": {
+    "Журнал — для звіту": {
       "main": [
         [
           {
-            "node": "Відповідь статистики",
+            "node": "Кухарі — для звіту",
             "type": "main",
             "index": 0
           }
-        ],
+        ]
+      ]
+    },
+    "Кухарі — для звіту": {
+      "main": [
         [
           {
-            "node": "Технічна помилка",
+            "node": "Щоденний звіт",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Щоденний звіт": {
+      "main": [
+        [
+          {
+            "node": "Щоденний звіт — надіслати",
             "type": "main",
             "index": 0
           }

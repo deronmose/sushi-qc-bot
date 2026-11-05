@@ -4,9 +4,7 @@ You need n8n 2.x (self-hosted or Cloud), a Telegram bot, an OpenAI API key and a
 
 ## 1. Telegram bot
 
-Create a bot with [@BotFather](https://t.me/BotFather) (`/newbot`) and copy the token. Then in n8n: **Credentials → New → Telegram API** → paste the token.
-
-Telegram allows only **one webhook per bot**. If another workflow already uses this bot, deactivate it first.
+Create a bot with [@BotFather](https://t.me/BotFather) (`/newbot`) and copy the token. Then in n8n: **Credentials → New → Telegram API** → paste the token. Telegram allows only **one webhook per bot**, so deactivate any other workflow that uses it.
 
 ## 2. OpenAI
 
@@ -14,66 +12,85 @@ In n8n: **Credentials → New → OpenAI** → paste an API key. The workflow us
 
 ## 3. Google Sheets via a service account
 
-1. In [Google Cloud Console](https://console.cloud.google.com) select or create a project. Then **APIs & Services → Library → Google Sheets API → Enable**.
-2. **IAM & Admin → Service Accounts → Create**. Open the account → **Keys → Add key → JSON**. Keep the file private and never commit it.
+1. In [Google Cloud Console](https://console.cloud.google.com): **APIs & Services → Library → Google Sheets API → Enable**.
+2. **IAM & Admin → Service Accounts → Create** → **Keys → Add key → JSON**. Keep the file private and never commit it.
 3. In n8n: **Credentials → New → Google Service Account API**. Enter the `client_email` and `private_key` from the JSON.
-4. Create a Google Sheet with three tabs. For each one use **File → Import → Upload** → *Insert new sheet(s)*, then rename the tab:
+4. Create a Google Sheet and **share** it with the service account's email as **Editor**.
 
-   | Tab name | File |
-   |---|---|
-   | `Техкарти` | `data/techcards.csv` |
-   | `Журнал` | `data/journal_template.csv` (header row only) |
-   | `Кухарі` | `data/cooks_template.csv` |
+## 4. Fill the sheet
 
-   The tab names must match exactly. The bot looks the tabs up by name.
-5. **Share** the sheet with the service account's email as **Editor**.
+**Data tabs.** For each file: **File → Import → Upload** → *Insert new sheet(s)* → rename the tab exactly:
 
-## 4. Import the workflow
+| Tab | File |
+|---|---|
+| `Техкарти` | `data/techcards.csv` |
+| `Точки` | `data/venues.csv` |
+| `Кухарі` | `data/cooks_template.csv` (replace the example rows with your people) |
+| `Журнал` | `data/demo_journal.csv` for the demo, or `data/journal_template.csv` (header only) |
+
+**Formula pages.**
+1. Generate the pages for your sheet's locale. Use `;` for Ukrainian, Russian and most European locales, and `,` for English:
+
+   ```bash
+   node tools/sheet-pages.js ";"
+   ```
+
+2. Import `data/pages/page-network.csv` first and rename its tab to **`Мережа`**. The other pages read its cell B2, the demo switch.
+3. Then import `page-V1.csv` … `page-V4.csv`; the tab names are free. Keep «Convert text to numbers, dates and formulas» on.
+4. If you have more or fewer kitchens, edit `data/venues.csv` before generating the pages.
+
+The bot finds tabs by name: `Техкарти`, `Журнал`, `Кухарі`, `Точки` must match exactly.
+
+## 5. Import the workflow
 
 1. In n8n: **Workflows → Import from file** → `workflows/sushi-qc-bot.json`.
-2. Open each node that shows a credential warning and pick your credentials:
-   - **Telegram** — the trigger, «Друкує…» and the reply nodes;
+2. Pick your credentials in every node that shows a warning:
+   - **Telegram** — the trigger, «Друкує…» and the reply and report nodes;
    - **OpenAI** — both Vision nodes;
-   - **Google** — the four Sheets nodes.
-3. In the four Google Sheets nodes, replace `REPLACE_WITH_YOUR_SPREADSHEET_ID` with your sheet ID. The ID is the part of the URL between `/d/` and `/edit`.
-4. Save the workflow, then **Activate** it.
+   - **Google** — all Sheets nodes.
+3. In every Google Sheets node, replace `REPLACE_WITH_YOUR_SPREADSHEET_ID` with your sheet ID (the part of the URL between `/d/` and `/edit`).
+4. Check the workflow timezone (Settings → Timezone, default `Europe/Kyiv`). The daily report runs at 22:00 in it; to change the time, edit the «Щодня о 22:00» node.
+5. Save and **Activate**.
 
-## 5. Let the cooks in
+## 6. Let people in
 
-Each cook writes `/start` to the bot. Until they are on the list, the bot answers with their Telegram ID. Add that ID to the `Кухарі` tab with `active = TRUE`. Start with yourself.
+Each person writes `/start` to the bot and gets their Telegram ID back. Add a row to `Кухарі`:
+- `chat_id` — the ID from the bot (the person's Telegram user ID — this is what ties them to a kitchen);
+- `venue_id` — `V1` … `V4`, an active row of `Точки`;
+- `venue` — the kitchen name (the bot takes the name from `Точки` anyway);
+- `role` — `cook`, `manager` or `owner`;
+- `active` — `TRUE`;
+- `allowed_venues` — optional, for people who work in several kitchens: `V3;V4`. Leave it empty to lock the person to `venue_id`.
 
-## 6. Check it
+Start with yourself as `owner`. A newly added person is recognised from their next message. Changes to existing rows apply within 5 minutes (the list is cached); the owner can send `/reload` to apply them at once.
 
-Send these to the bot:
+## 7. Check it
 
 | Message | Expected reply |
 |---|---|
-| `/help` | usage instructions |
+| `/help` | usage instructions for your role, with the «📍 Точка» and «📊 Статистика» buttons |
+| «📍 Точка» (owner) | buttons for all kitchens; tapping one switches where your checks go |
+| photo + `R25 V3` from a cook locked to V2 | ⛔ not logged, the bot names the cook's kitchen |
 | photo + `Тех карта <the weight on the display>` | ✅ У нормі |
-| photo + `Тех карта <weight − 30>` | ⛔️ БРАК |
-| photo + `Тех карта <half the weight>` | 🔎 Перевірте фото (deviation over 30%) |
+| photo + `Тех карта <weight + 10%>` | ⬆️ ПЕРЕВАГА |
+| photo + `Тех карта <weight − 5%>` | ⬇️ НЕДОВАГА |
 | a salmon roll photo + `Філадельфія з вугрем` | 🚫 Фото не схоже… |
-| photo without a caption | auto by weight, or ⚠️ with candidates |
 | the same photo again | ♻️ already checked |
-| `/stats` | today's summary |
+| `/stats` (owner) | all kitchens side by side |
+| `/stats V2` (owner) | one kitchen |
+| `/report` (owner) | today's daily report |
 
-Every checked photo adds a row to `Журнал`.
+Every checked photo adds a row to `Журнал` with the sender's kitchen.
 
 ## Tuning
 
-**Recipe cards (the `Техкарти` tab):**
-- **Tolerance** — the `tolerance_pct` column per dish. The default is 2.9%, used when the cell is empty and for «Тех карта N» captions. It is set by `DEFAULT_TOL` in `src/verdict.js`.
-- **Packaging** — `pack_grams` per dish: the weight of the box or bowl a portion is usually weighed in. It is subtracted only when Vision sees a container and that brings the reading closer to the norm. Zeroing the scale with the empty container (TARE) is still the reliable way.
-- **New dishes** — add a row. Give it:
-  - a unique `dish_id`;
-  - a few aliases cooks actually use. Don't give two dishes the same generic alias (such as «темпура»): leave such words out, and the weight or the candidate list will sort it out;
-  - `must_have` — only what tells this dish apart (the fish or topping on top, the coating, baked or fried, the type);
-  - `may_vary` — garnish and sauce that may or may not be there.
-- **Hide a dish** — set `active` to `FALSE`.
+**Recipe cards and reports:**
+- **Tolerances** — `tol_under_pct` and `tol_over_pct` per dish. Defaults when empty: 2.9% / 5% (`DEFAULT_UNDER`, `DEFAULT_OVER` in `src/verdict.js`).
+- **Packaging** — `pack_grams` per dish. It is subtracted only when Vision sees a container and that brings the reading closer to the norm; zeroing the scale (TARE) is the reliable way.
+- **New dishes** — a unique `dish_id`, aliases cooks really use (no generic alias shared by two dishes), `must_have` (what tells the dish apart) and `may_vary` (garnish, sauce).
+- **Demo rows in reports** — `INCLUDE_DEMO` in `src/report-lib.js`; on the sheet pages, cell `Мережа!B2` (ТАК / НІ). For a real kitchen, start the journal from the header-only template.
 
-**Bot logic (`src/verdict.js`):**
-- **Thresholds** — `PLAUSIBLE` (30%: a bigger deviation becomes RECHECK), `MIN_DIGITS` (0.6) and `MIN_VISUAL` (0.7: the Vision confidence needed for MISMATCH).
-- **Timezone** — workflow settings → Timezone (default `Europe/Kyiv`). It is also hard-coded in the `ts`/`date` formatting in `src/verdict.js` and `src/stats.js`.
+**Thresholds** in `src/verdict.js`: `PLAUSIBLE` (30%), `MIN_DIGITS` (0.6), `MIN_VISUAL` (0.7).
 
 ## Changing the code
 
@@ -86,4 +103,4 @@ node tests/run-scenarios.js
 node tools/build-workflow.js
 ```
 
-Re-import `workflows/sushi-qc-bot.json`, or paste the changed file into the matching Code node.
+Re-import `workflows/sushi-qc-bot.json` (or paste the changed file into the matching Code node). Regenerate the demo journal with `node tools/gen-demo-history.js --end YYYY-MM-DD`.

@@ -1,2 +1,5 @@
-chat_id,name,venue,active
-123456789,Ім'я кухаря,Nori Lab,TRUE
+chat_id,name,venue_id,venue,role,active,allowed_venues
+111111111,Власник мережі,V1,Nori Lab Поділ,owner,TRUE,
+222222222,Шеф Лівобережної,V2,Nori Lab Лівобережна,manager,TRUE,
+333333333,Кухар Лівобережної,V2,Nori Lab Лівобережна,cook,TRUE,
+444444444,Підмінний кухар,V3,Nori Lab Печерськ,cook,TRUE,V3;V4

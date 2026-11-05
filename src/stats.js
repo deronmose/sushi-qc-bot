@@ -1,38 +1,28 @@
-// Code node «Зведення» — runs once for all items (input: rows of the «Журнал» sheet). Builds the /stats reply.
-const readErr = $input.all().find(i => i.json && i.json.error);
+// Code node «Зведення» — /stats. Input: rows of the «Журнал» sheet. report-lib (RL) is inlined above by the build.
+//   cook / manager → own kitchen; owner → the whole network, or one kitchen with «/stats V2».
+const readErr = $input.all().find((i) => i.json && i.json.error);
 if (readErr) throw new Error('Журнал: ' + readErr.json.error);
 
-const N = '\n';
 const msg = $('Telegram Trigger').first().json.message || {};
-const rows = $input.all().map(i => i.json).filter(r => r && r.verdict);
-const scopeAll = /(all|все|всі|усі|весь)/i.test(String(msg.text || ''));
-const today = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Kyiv' }).format(new Date());
-const inScope = scopeAll ? rows : rows.filter(r => String(r.date || '').slice(0, 10) === today);
-const cnt = v => inScope.filter(r => r.verdict === v).length;
-const devs = inScope.filter(r => r.verdict === 'OK' || r.verdict === 'BRAK')
-  .map(r => Math.abs(Number(String(r.deviation_pct).replace(',', '.')))).filter(Number.isFinite);
-const avg = devs.length ? Math.round(devs.reduce((a, b) => a + b, 0) / devs.length * 10) / 10 : null;
-const icon = { BRAK: '⛔️', MISMATCH: '🚫', RECHECK: '🔎', LOWCONF: '⚠️', UNREADABLE: '❓' };
-const has = x => x !== '' && x != null;
-const failed = inScope.filter(r => r.verdict !== 'OK');
-const lines = failed.slice(-20).reverse().map(r => {
-  const g = has(r.net_grams) ? r.net_grams : (has(r.scale_grams) ? r.scale_grams : r.actual_grams);
-  return (icon[r.verdict] || '•') + ' ' + String(r.ts || '').slice(5, 16) + ' '
-    + ([r.dish_id, r.dish_name].filter(Boolean).join(' ') || '—')
-    + (has(g) ? ': ' + g + ' г' : '')
-    + (has(r.deviation_pct) ? ' (' + (Number(r.deviation_pct) > 0 ? '+' : '') + r.deviation_pct + '%)' : '')
-    + (r.chef ? ' — ' + r.chef : '');
-});
-let parts = ['📊 Статистика ' + (scopeAll ? 'за весь час' : 'за сьогодні (' + today + ')'), '',
-  'Всього перевірок: ' + inScope.length,
-  '✅ У нормі: ' + cnt('OK'),
-  '⛔️ Брак: ' + cnt('BRAK'),
-  '🚫 Фото ≠ підпис: ' + cnt('MISMATCH'),
-  '🔎 Перевірити: ' + cnt('RECHECK'),
-  '⚠️ Невизначено: ' + cnt('LOWCONF'),
-  '❓ Нечитабельно: ' + cnt('UNREADABLE')];
-if (avg != null) parts.push('Середнє відхилення: ' + avg + '%');
-if (failed.length) { parts.push('', 'Останні проблемні (' + Math.min(20, failed.length) + ' з ' + failed.length + '):'); parts = parts.concat(lines); }
-else parts.push('', 'Проблемних перевірок немає 👌');
-if (!scopeAll) parts.push('', '«/stats all» — за весь час.');
-return [{ json: { chat_id: String((msg.chat && msg.chat.id) ?? ''), reply: parts.join(N).slice(0, 3800) } }];
+const cook = $('Кухар').first().json.cook || {};
+const text = String(msg.text || '');
+const rows = $input.all().map((i) => i.json);
+const p = RL.periodFrom(text);
+const wantVenue = RL.venueFrom(text);
+const hint = '«/stats all» — за весь час · «/stats 7» — за тиждень';
+let reply;
+if (cook.role === 'owner') {
+  if (wantVenue) {
+    const vr = RL.filterRows(rows, { venue: wantVenue, from: p.from });
+    const name = (rows.find((r) => String(r.venue_id).trim().toUpperCase() === wantVenue) || {}).venue || '';
+    reply = RL.venueReport(vr, (wantVenue + ' ' + name).trim(), p.label) + '\n\n' + hint;
+  } else {
+    reply = RL.networkReport(RL.filterRows(rows, { from: p.from }), p.label) + '\n\n«/stats V2» — одна точка · ' + hint;
+  }
+} else {
+  const vr = RL.filterRows(rows, { venue: cook.venue_id, from: p.from });
+  reply = RL.venueReport(vr, ((cook.venue_id || '') + ' ' + (cook.venue || '')).trim(), p.label)
+    + (wantVenue && wantVenue !== cook.venue_id ? '\n\nℹ️ Статистика інших точок доступна лише власнику мережі.' : '')
+    + '\n\n' + hint;
+}
+return [{ json: { chat_id: String((msg.chat && msg.chat.id) ?? ''), reply: reply.slice(0, 3900) } }];
