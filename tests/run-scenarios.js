@@ -218,6 +218,17 @@ expect('/report for a cook → refused', /лише власнику/.test(denied
 const people = [{ chat_id: 1, role: 'owner', venue_id: 'V1', active: true }, { chat_id: 2, role: 'manager', venue_id: 'V2', venue: 'Nori Lab Лівобережна', active: 'TRUE' }, { chat_id: 3, role: 'cook', venue_id: 'V2', active: true }, { chat_id: 4, role: 'manager', venue_id: 'V3', active: false }];
 const daily = run(DAILY, { input: people, nodes: { 'Журнал — для звіту': journal.map((j) => ({ json: j })) } }).map((i) => i.json);
 expect('daily report: owner gets the network, each active manager their kitchen, cooks nothing', daily.length === 2 && /Мережа/.test(daily.find((d) => d.chat_id === '1').reply) && /V2 Nori Lab Лівобережна/.test(daily.find((d) => d.chat_id === '2').reply));
+// UPD 2026-11-05: the 22:00 report of 5 Nov showed 54 checks but its categories summed to 50, and named only V1 of three kitchens at 50%
+const VN = { V1: 'Nori Lab Поділ', V2: 'Nori Lab Лівобережна', V3: 'Nori Lab Печерськ', V4: 'Nori Lab Оболонь' };
+const rowsOf = (venue, verdict, n, dev = '') => Array.from({ length: n }, () => ({ venue_id: venue, venue: VN[venue], date: today, verdict, deviation_pct: dev, dish_id: 'R09', dish_name: 'Червоний дракон' }));
+const netToday = (rows) => run(STATS, { input: rows, nodes: { 'Telegram Trigger': trigger('', '', '/stats'), 'Кухар': { json: OWNER } } })[0].json.reply;
+const tie = netToday([...rowsOf('V1', 'OK', 3), ...rowsOf('V1', 'LOWCONF', 2), ...rowsOf('V1', 'UNREADABLE', 1),
+  ...rowsOf('V2', 'OK', 3), ...rowsOf('V2', 'UNDER', 3, -4),
+  ...rowsOf('V3', 'OK', 8), ...rowsOf('V3', 'OVER', 2, 6)]);
+expect('network line: ⚠️ counts undetermined + unreadable, so the categories add up', /V1 Nori Lab Поділ: 6 перевірок\n\s+✅ 50% · ⬇️ 0 · ⬆️ 0 · 🚫 0 · 🔎 0 · ⚠️ 3/.test(tie) && /Разом: 22 · .*⚠️ 3/.test(tie) && /⚠️ не визначено або нечитабельно/.test(tie), tie);
+expect('lowest share in norm: a tie names every tied kitchen', /Найнижчий % у нормі \(50%\): V1 Nori Lab Поділ, V2 Nori Lab Лівобережна/.test(tie) && !/Печерськ \(80%\)/.test(tie));
+const allTie = netToday([...rowsOf('V1', 'OK', 5), ...rowsOf('V2', 'OK', 5)]);
+expect('lowest share in norm: no "lowest" line when every kitchen is equal', !/Найнижчий/.test(allTie) && /Разом: 10/.test(allTie), allTie);
 
 // — demo history agrees with the verdict rule —
 const cardsById = Object.fromEntries(sheetRows.map((c) => [c.dish_id, c]));

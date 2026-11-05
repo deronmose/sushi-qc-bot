@@ -17,15 +17,17 @@ From the demo history (last 7 days, `/stats 7` in Telegram — the same numbers 
 
 ```
 🏢 Мережа — за 7 днів
-V1 Nori Lab Поділ: 201 перевірок        ✅ 92.5% · ⬇️ 3 (-3.2%) · ⬆️ 0 · 🚫 3 · 🔎 2
-V2 Nori Lab Лівобережна: 189 перевірок  ✅ 58.2% · ⬇️ 62 (-4%) · ⬆️ 0 · 🚫 5 · 🔎 4
-V3 Nori Lab Печерськ: 212 перевірок     ✅ 70.8% · ⬇️ 1 (-3.5%) · ⬆️ 44 (+6.4%) · 🚫 4 · 🔎 4
-V4 Nori Lab Оболонь: 209 перевірок      ✅ 69.4% · ⬇️ 11 (-4.3%) · ⬆️ 2 (+5.2%) · 🚫 12 · 🔎 10
+V1 Nori Lab Поділ: 201 перевірок        ✅ 92.5% · ⬇️ 3 (-3.2%) · ⬆️ 0 · 🚫 3 · 🔎 2 · ⚠️ 7
+V2 Nori Lab Лівобережна: 189 перевірок  ✅ 58.2% · ⬇️ 62 (-4%) · ⬆️ 0 · 🚫 5 · 🔎 4 · ⚠️ 8
+V3 Nori Lab Печерськ: 212 перевірок     ✅ 70.8% · ⬇️ 1 (-3.5%) · ⬆️ 44 (+6.4%) · 🚫 4 · 🔎 4 · ⚠️ 9
+V4 Nori Lab Оболонь: 209 перевірок      ✅ 69.4% · ⬇️ 11 (-4.3%) · ⬆️ 2 (+5.2%) · 🚫 12 · 🔎 10 · ⚠️ 29
+Разом: 811 · ✅ 72.9% · ⬇️ 77 (-4%) · ⬆️ 46 (+6.4%) · 🚫 24 · 🔎 20 · ⚠️ 53
+Найнижчий % у нормі: V2 Nori Lab Лівобережна (58.2%)
 Найбільше недоваги: V2 Nori Lab Лівобережна (62 з 189, середня -4%)
 Найбільше переваги: V3 Nori Lab Печерськ (44 з 212, середня +6.4%)
 ```
 
-`/stats V2` then shows that kitchen's worst dishes (the Philadelphias and the Philadelphia set) and cooks.
+The categories always add up to the number of checks: ⚠️ counts the photos the bot couldn't identify or read, which is V4's weak spot. When kitchens tie on the share in norm, all of them are named. `/stats V2` then shows that kitchen's worst dishes (the Philadelphias and the Philadelphia set) and cooks.
 
 ## How it works
 
@@ -103,7 +105,7 @@ tools/sheet-pages.js          formulas for «Мережа» and the kitchen page
 tools/gen-demo-history.js     deterministic two-week demo journal → data/demo_journal.csv
 workflows/sushi-qc-bot.json   n8n workflow (credentials and spreadsheet ID are placeholders)
 data/                         techcards, venues, cooks and journal templates, demo journal, page CSVs
-tests/run-scenarios.js        78 offline tests (no n8n or API keys needed)
+tests/run-scenarios.js        81 offline tests (no n8n or API keys needed)
 docs/setup.md                 step-by-step installation
 docs/recognition-qa.ru.md     recognition QA: user questions, failure modes, fixes, before/after (in Russian)
 ```
@@ -123,14 +125,14 @@ Full steps are in **[docs/setup.md](docs/setup.md)**.
 node tests/run-scenarios.js
 ```
 
-The 78 checks run the Code node sources (and the built workflow) against the recipe cards, with Telegram and Vision replaced by fixtures:
+The 81 checks run the Code node sources (and the built workflow) against the recipe cards, with Telegram and Vision replaced by fixtures:
 - underweight and overweight at the edges of the asymmetric tolerance;
 - captions: codes, aliases, Russian spelling, generic words;
 - units, portions, container, misreads, the visual check, repeat photos and corrections;
 - the kitchen lock: another kitchen's code, the own code, `allowed_venues`, the owner, unknown and inactive kitchens, lookup by Telegram ID;
 - «📍 Точка» switching, caches, role-aware help, roles in `/stats` and `/report`;
 - every Telegram message is sent as HTML with names and replies escaped;
-- the daily report going to the right people;
+- the daily report going to the right people; categories adding up and ties named in the network report;
 - every one of the 1 495 weighed demo rows agrees with the verdict rule.
 
 How the bot behaves on real photos is measured on a separate n8n eval stand: [docs/recognition-qa.ru.md](docs/recognition-qa.ru.md).

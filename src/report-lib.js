@@ -41,7 +41,9 @@ const RL = (() => {
   const pct = (v) => (v == null ? '—' : v + '%');
   const sgn = (v) => (v == null ? '' : (v > 0 ? '+' : '') + v + '%');
   const kinds = (e) => [e.UNDER ? '⬇️' + e.UNDER : '', e.OVER ? '⬆️' + e.OVER : '', e.MISMATCH ? '🚫' + e.MISMATCH : ''].filter(Boolean).join(' ');
-  const line = (s) => `✅ ${pct(s.okPct)} · ⬇️ ${s.UNDER}${s.UNDER ? ' (' + sgn(s.avgUnder) + ')' : ''} · ⬆️ ${s.OVER}${s.OVER ? ' (' + sgn(s.avgOver) + ')' : ''} · 🚫 ${s.MISMATCH} · 🔎 ${s.RECHECK}`;
+  // UPD 2026-11-05: ⚠️ (undetermined + unreadable) added so the categories add up to the check count
+  const line = (s) => `✅ ${pct(s.okPct)} · ⬇️ ${s.UNDER}${s.UNDER ? ' (' + sgn(s.avgUnder) + ')' : ''} · ⬆️ ${s.OVER}${s.OVER ? ' (' + sgn(s.avgOver) + ')' : ''} · 🚫 ${s.MISMATCH} · 🔎 ${s.RECHECK} · ⚠️ ${s.LOWCONF + s.UNREADABLE}`;
+  const LEGEND = '✅ у нормі · ⬇️ недовага · ⬆️ перевага · 🚫 фото ≠ підпис · 🔎 перевірити · ⚠️ не визначено або нечитабельно';
   const dishKey = (r) => [r.dish_id, r.dish_name].filter(Boolean).join(' ');
 
   function venueReport(rows, title, period) {
@@ -69,17 +71,22 @@ const RL = (() => {
     L.push('', `Разом: ${all.total} · ${line(all)}`);
     const withData = per.filter((v) => v.s.total >= 5);
     if (withData.length > 1) {
-      const by = (f) => withData.slice().sort((a, b) => f(b) - f(a))[0];
-      const worst = by((v) => -(v.s.okPct ?? 0));
-      const under = by((v) => v.s.UNDER / v.s.total);
-      const over = by((v) => v.s.OVER / v.s.total);
-      L.push('', `Найнижчий % у нормі: ${worst.id} ${worst.name} (${pct(worst.s.okPct)})`);
-      if (under.s.UNDER) L.push(`Найбільше недоваги: ${under.id} ${under.name} (${under.s.UNDER} з ${under.s.total}, середня ${sgn(under.s.avgUnder)})`);
-      if (over.s.OVER) L.push(`Найбільше переваги: ${over.id} ${over.name} (${over.s.OVER} з ${over.s.total}, середня ${sgn(over.s.avgOver)})`);
+      // UPD 2026-11-05: a tie names every kitchen that shares the value; when all kitchens tie there is no "lowest"
+      const leaders = (f) => { const best = Math.max(...withData.map(f)); return withData.filter((v) => f(v) === best); };
+      const worst = leaders((v) => -(v.s.okPct ?? 0));
+      const under = leaders((v) => v.s.UNDER / v.s.total);
+      const over = leaders((v) => v.s.OVER / v.s.total);
+      const H = [];
+      if (worst.length === 1) H.push(`Найнижчий % у нормі: ${worst[0].id} ${worst[0].name} (${pct(worst[0].s.okPct)})`);
+      else if (worst.length < withData.length) H.push(`Найнижчий % у нормі (${pct(worst[0].s.okPct)}): ${worst.map((v) => v.id + ' ' + v.name).join(', ')}`);
+      if (under[0].s.UNDER) H.push('Найбільше недоваги: ' + under.map((v) => `${v.id} ${v.name} (${v.s.UNDER} з ${v.s.total}, середня ${sgn(v.s.avgUnder)})`).join('; '));
+      if (over[0].s.OVER) H.push('Найбільше переваги: ' + over.map((v) => `${v.id} ${v.name} (${v.s.OVER} з ${v.s.total}, середня ${sgn(v.s.avgOver)})`).join('; '));
+      if (H.length) L.push('', ...H);
     }
     const td = top(rows, dishKey);
     if (td.length) { L.push('', 'Страви з відхиленнями по мережі:'); for (const e of td) L.push(`• ${e.k}: ${e.n} (${kinds(e)})`); }
     if (!all.total) L.push('Перевірок за цей період немає.');
+    else L.push('', LEGEND);
     return L.join('\n');
   }
   function periodFrom(text) {
