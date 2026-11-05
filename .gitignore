@@ -1,6 +1,9 @@
 # Local backups of the original prototype (contain client data) — never publish
 _backup/
 
+# Recognition QA working files (third-party test photos, raw eval output)
+_qa/
+
 # Secrets
 .env
 *.env
